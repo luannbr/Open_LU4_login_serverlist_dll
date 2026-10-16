@@ -1,0 +1,13 @@
+# Normaliza fim de linha: no repo fica LF; no checkout o git cuida (silencia LF/CRLF).
+* text=auto eol=lf
+
+# Scripts Windows mantêm CRLF no checkout.
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binários: git não mexe.
+*.exe  binary
+*.dll  binary
+*.ucas binary
+*.utoc binary
+*.pak  binary
