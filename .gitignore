@@ -1,0 +1,11 @@
+# Credenciais e estado local — NUNCA versionar
+lu4launcher.ini
+lu4accounts.dat
+*.log
+
+# Artefatos de build
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
