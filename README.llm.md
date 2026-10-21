@@ -3,6 +3,10 @@
 Dense, factual reference for an AI agent working on this repo. Human-readable docs:
 [English](README.md) · [Português](README.pt-BR.md).
 
+Branch `Cliente-18-10-2026`: `lu4authhook.dll`/`.cpp`, `inject.exe`/`.cpp`, `Inject-LU4.ps1` and
+`build_hook.bat` are removed here (they stay on `main`); the `lu4.bin` client uses `lu4loader`.
+Sections about the hook describe `main`. `lu4launcher` needs the DLL from `main`.
+
 ## 1. One-line purpose
 Client-side DLL (`lu4authhook.dll`) + launcher that let the **LU4** game client
 (`lu4-win64-shipping.exe`, Lineage 2–based, Unreal Engine 5.4, Windows x64) authenticate and

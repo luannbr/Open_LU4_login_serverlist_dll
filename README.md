@@ -2,6 +2,12 @@
 
 **Languages:** **English** · [Português](README.pt-BR.md) · [LLM / agent reference](README.llm.md)
 
+> **Branch `Cliente-18-10-2026`:** for the `lu4.bin` client, which logs in with the DLL-free
+> loader (see [DLL-free loader](#dll-free-loader-lu4loader-client-of-18-10-2026)). This branch no
+> longer ships `lu4authhook.dll`, `inject.exe` or `Inject-LU4.ps1`; the hook and injection
+> sections below describe the `main` branch, where they still are. `lu4launcher` needs the DLL
+> and only works with the files from `main`.
+
 Client-side tooling that lets the **LU4** game client (a *Lineage 2*–based title on Unreal
 Engine 5.4) log in to a **private / emulator server** instead of the official auth servers.
 
@@ -206,19 +212,13 @@ Edit `LOGIN_RVA` / `CMP_RVA` in `src/lu4authhook.cpp` and rebuild.
 dist/
   lu4launcher_gui.exe     GUI launcher (accounts, one-click play)
   lu4launcher.exe         console launcher
-  lu4authhook.dll         the hook (login validation + serverlist MAC bypass)
-  inject.exe              standalone DLL injector (remote LoadLibraryW)
-  Inject-LU4.ps1          finds the game process and injects
   lu4launcher.ini.example config template (copy to lu4launcher.ini)
   lu4loader_gui.exe       DLL-free loader for lu4.bin, GUI (client of 18-10-2026)
   lu4loader.exe           DLL-free loader, console
   lu4loader.ini.example   loader config template (copy to lu4loader.ini)
 src/
-  lu4authhook.cpp         hook source
-  inject.cpp              injector source
   lu4launcher.c           console launcher source
   lu4launcher_gui.c       GUI launcher source
-  build_hook.bat          builds the DLL
   build_launcher.bat      builds both launchers
   lu4loader.c             DLL-free loader source, console
   lu4loader_gui.c         DLL-free loader source, GUI
