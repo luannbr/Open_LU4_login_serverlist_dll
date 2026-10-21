@@ -1,6 +1,8 @@
 # Credenciais e estado local — NUNCA versionar
 lu4launcher.ini
+lu4loader.ini
 lu4accounts.dat
+lu4loader_accounts.dat
 *.log
 
 # Artefatos de build

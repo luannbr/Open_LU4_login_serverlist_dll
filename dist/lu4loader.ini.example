@@ -1,0 +1,28 @@
+# lu4loader.ini  --  copie para "lu4loader.ini" (ao lado do .exe) e ajuste. NUNCA comite o .ini.
+# Config do lu4loader (launcher SEM DLL injetada e SEM clmods). Chaves sem secao.
+
+# Cliente DEBUG (lu4.bin). Relativo a pasta do loader, ou absoluto.
+GameExe=lu4\binaries\win64\lu4.bin
+
+# Credenciais (OBRIGATORIAS: o bridge precisa delas; o servidor nao decifra as do cliente).
+# Deixe em branco (remova) p/ o loader perguntar no console.
+Login=
+Pass=
+
+# 1 = passa -ID/-PWD pro cliente (preenche o form automaticamente). 0 = voce digita no jogo.
+AutoFillLogin=1
+
+# Rede local (dev): monta loopback 185.29.255.102 + portproxy 2108->2107 (precisa Admin).
+# Em producao (IP real do servidor), use LocalDev=0.
+LocalDev=1
+LoginIp=185.29.255.102
+LoginPort=2108
+AuthPort=2107
+
+# Validator de credenciais do AuthD (precisa Lu4Mode=true no AuthD\etc\config.txt).
+ValidatorHost=127.0.0.1
+ValidatorPort=27110
+
+GameArgs=LU4 -USEALLAVAILABLECORES
+# Quanto esperar o cliente carregar (WorkingSet em MB) antes de patchar o MAC (patch tardio).
+WaitMB=1500

@@ -15,8 +15,8 @@ against a local TCP validator and (b) neutralizing the ServerList 32-byte MAC ch
   memory-scan hiding, or anything targeting official/commercial servers.
 - Only two code sites in the client are modified (login call + 32-byte serverlist compare). Keep
   the blast radius minimal.
-- Never commit secrets: real `lu4launcher.ini` (may hold `Login`/`Pass`), `lu4accounts.dat`,
-  `*.log`. They are in `.gitignore`.
+- Never commit secrets: real `lu4launcher.ini` / `lu4loader.ini` (may hold `Login`/`Pass`),
+  `lu4accounts.dat`, `lu4loader_accounts.dat`, `*.log`. They are in `.gitignore`.
 
 ## 3. Components
 | Binary | Source | Role |
@@ -26,6 +26,9 @@ against a local TCP validator and (b) neutralizing the ServerList 32-byte MAC ch
 | `Inject-LU4.ps1` | — | finds game process, calls `inject.exe` |
 | `lu4launcher.exe` | `src/lu4launcher.c` | console launcher |
 | `lu4launcher_gui.exe` | `src/lu4launcher_gui.c` | Win32 GUI launcher (multi-account) |
+| `lu4loader.exe` | `src/lu4loader.c` | DLL-free loader for `lu4.bin` (client of 18-10-2026), console: starts the client, late-patches the 32-byte compare to a code cave accepting the MAC marker, feeds `AUTH	<login>	<password>
+` to the validator (27110). Needs the server's 37-byte `lu4.bin` Init (Open_LU4_L2OFF branch `Cliente-18-10-2026`). |
+| `lu4loader_gui.exe` | `src/lu4loader_gui.c` | same loader, Win32 GUI (accounts in `lu4loader_accounts.dat`) |
 
 ## 4. Hook internals (`lu4authhook.cpp`)
 Constants (build-specific; `base = GetModuleHandleW(NULL)`):

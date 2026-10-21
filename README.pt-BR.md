@@ -80,6 +80,30 @@ tocados; todo o resto do cliente roda byte-a-byte como antes.
   `LU4 -USEALLAVAILABLECORES -ID <login> -PWD <senha>`, esperam ~1,2 s e injetam a
   `lu4authhook.dll` via `LoadLibraryW` remoto.
 
+### Loader sem DLL (`lu4loader`, cliente de 18-10-2026)
+Para o build **`lu4.bin`** do cliente. Nada é injetado, e o launcher oficial (com o módulo
+`clmods64` que ele carrega) não é usado.
+- **`lu4loader_gui.exe`** — janela com contas salvas (`lu4loader_accounts.dat`, senha ofuscada com
+  XOR, **não** é segurança). **`lu4loader.exe`** — versão de console.
+- O que faz: pega login/senha (`--id`/`--pwd`, `lu4loader.ini`, ou pergunta); no dev local monta o
+  loopback + portproxy; inicia o `lu4.bin` direto com `LU4 -USEALLAVAILABLECORES` (mais `-ID`/`-PWD`
+  quando `AutoFillLogin=1`); espera o cliente carregar (working set acima de `WaitMB`); desvia a
+  comparação de 32 bytes da serverlist para um pequeno code cave que aceita o marcador de MAC do
+  servidor; manda `AUTH	<login>	<senha>
+` para o validador de credenciais do servidor
+  (porta 27110) e o renova enquanto a janela estiver aberta.
+- **Precisa de um servidor compatível.** O servidor tem que mandar o Init de 37 bytes do `lu4.bin`,
+  que faz o cliente instalar a chave Blowfish de sessão que o servidor espera (`kInitHex` do
+  AuthGateD em [Open_LU4_L2OFF, branch `Cliente-18-10-2026`](https://github.com/luannbr/Open_LU4_L2OFF/tree/Cliente-18-10-2026),
+  `AuthGateD/src/Lu4Login.cpp`). Sem ele o login decifra lixo, com ou sem loader. O servidor também
+  precisa do AuthD com `Lu4Mode=true` e o validador na 27110 (credenciais reaproveitáveis dentro do
+  TTL, para relogar sem reabrir o cliente) e da porta de login LU4 (2107) alcançável a partir de
+  `LoginIp:LoginPort`.
+- Config: copie `dist/lu4loader.ini.example` para `lu4loader.ini` ao lado do exe. Nunca comite.
+- Compilar: `src/build_lu4loader.bat` (as duas versões).
+- Estado: login verificado de ponta a ponta com o protótipo em Python deste loader; a versão em C é
+  um porte dele, com os mesmos bytes de patch e a mesma mensagem ao validador.
+
 ---
 
 ## Requisitos
@@ -187,6 +211,9 @@ dist/
   inject.exe              injetor de DLL avulso (LoadLibraryW remoto)
   Inject-LU4.ps1          acha o processo do jogo e injeta
   lu4launcher.ini.example modelo de config (copie para lu4launcher.ini)
+  lu4loader_gui.exe       loader sem DLL para o lu4.bin, gráfico (cliente de 18-10-2026)
+  lu4loader.exe           loader sem DLL, console
+  lu4loader.ini.example   modelo de config do loader (copie para lu4loader.ini)
 src/
   lu4authhook.cpp         fonte do hook
   inject.cpp              fonte do injetor
@@ -194,6 +221,9 @@ src/
   lu4launcher_gui.c       fonte do launcher gráfico
   build_hook.bat          compila a DLL
   build_launcher.bat      compila os dois launchers
+  lu4loader.c             fonte do loader sem DLL, console
+  lu4loader_gui.c         fonte do loader sem DLL, gráfico
+  build_lu4loader.bat     compila as duas versões do loader
 ```
 
 ## Notas de segurança
