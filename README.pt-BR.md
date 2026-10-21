@@ -1,209 +1,199 @@
-# LU4 Login / ServerList DLL + Launcher
+# LU4 Loader — login sem DLL (cliente de 18-10-2026)
 
 **Idiomas:** [English](README.md) · **Português** · [Referência p/ LLM / agente](README.llm.md)
 
-> **Branch `Cliente-18-10-2026`:** para o cliente `lu4.bin`, que loga com o loader sem DLL (veja
-> [Loader sem DLL](#loader-sem-dll-lu4loader-cliente-de-18-10-2026)). Este branch não traz mais o
-> `lu4authhook.dll`, o `inject.exe` nem o `Inject-LU4.ps1`; as seções de hook e injeção abaixo
-> descrevem o branch `main`, onde eles continuam. O `lu4launcher` precisa da DLL e só funciona
-> com os arquivos do `main`.
+> **Branch `Cliente-18-10-2026`.** Este branch tem só o **`lu4loader`**, o loader sem DLL para o
+> cliente **`lu4.bin`**. O sistema anterior para o `lu4-win64-shipping.exe` (`lu4authhook.dll`, o
+> injetor e o `lu4launcher`) está no branch
+> [`main`](https://github.com/luannbr/Open_LU4_login_serverlist_dll/tree/main).
 
 Ferramentas do **lado cliente** que permitem ao cliente do jogo **LU4** (um título baseado em
 *Lineage 2* rodando na Unreal Engine 5.4) logar num **servidor privado / emulador** em vez dos
-servidores de autenticação oficiais.
+servidores de autenticação oficiais — **sem injetar nenhuma DLL** no jogo.
 
-Inclui duas coisas:
+Inclui uma ferramenta em duas versões:
 
-1. **`lu4authhook.dll`** — uma DLL injetada no processo do jogo que
-   - **valida login/senha contra o seu próprio servidor**, lendo as credenciais em texto puro na
-     UI (antes de serem cifradas), e
-   - **contorna a verificação de MAC da ServerList**, pra o seu AuthServer poder mandar uma lista
-     de servidores dinâmica.
-2. **Um launcher** (gráfico + console) que cria/guarda contas, inicia o cliente e injeta o hook
-   num clique.
+1. **`lu4loader_gui.exe`** — janela com contas salvas: escolha a conta e clique em **JOGAR**.
+2. **`lu4loader.exe`** — o mesmo loader como programa de console (args, ini ou pergunta).
 
-> ⚠️ **Escopo e aviso.** Isto é **ferramenta de interoperabilidade / emulação de servidor para
-> servidores privados que você mesmo opera**, no espírito da antiga comunidade de *free shards*
-> de L2. **Não** é bypass de anti-cheat e **não** derrota proteção de integridade do jogo — só
-> mexe no handshake de login e na assinatura da lista de servidores. Use **apenas** com os seus
-> servidores e a sua instalação do cliente, para estudo, preservação e desenvolvimento. **Não**
-> use contra servidores oficiais/comerciais nem para violar os Termos de Serviço de ninguém ou a
-> lei local. Você é responsável pelo uso.
+As duas iniciam o cliente, aplicam um pequeno patch de fora do processo (a checagem da assinatura
+da ServerList) e entregam a conta ao validador de credenciais do seu servidor.
+
+> ⚠️ **Escopo e aviso.** Isto é **ferramenta de interoperabilidade / emulação para servidores
+> privados que você mesmo opera**, no espírito da antiga comunidade de free-shards de L2. Use
+> **só** com os seus servidores e a sua instalação do cliente, para estudo, preservação e
+> desenvolvimento. **Não** use contra servidores oficiais/comerciais nem para violar Termos de
+> Serviço ou leis. O uso é responsabilidade sua.
 
 ---
 
 ## Por que isso existe
 
-O cliente LU4 cifra o pacote de login com uma chave Blowfish estática **virtualizada pelo
-VMProtect** — ela não é extraível, então um emulador não consegue verificar senhas do jeito
-"normal" (o handshake acaba virando um *replay* de pacote que aceita qualquer senha). Além disso,
-cada pacote de ServerList do auth carrega um **MAC de 32 bytes** assinado com um segredo que o
-emulador não tem, então uma lista feita em casa é rejeitada.
+Duas coisas impedem o cliente LU4 de logar num emulador:
 
-Este projeto resolve os dois **no lado cliente**, de forma cirúrgica:
+- Toda resposta do servidor de login leva uma **assinatura Ed25519 de 32 bytes**, feita com a chave
+  privada do servidor oficial. Um emulador não consegue gerá-la, então uma lista de servidores
+  própria é rejeitada.
+- O pacote de login é cifrado com uma **chave Blowfish de sessão** que o cliente tira do pacote
+  Init do servidor, e o bloco da conta dentro dele não pode ser lido pelo servidor.
 
-| Problema | Solução na `lu4authhook.dll` |
+O branch `main` resolvia isso com uma DLL injetada no `lu4-win64-shipping.exe`. O cliente
+`lu4.bin` de 18-10-2026 é atendido sem DLL nenhuma:
+
+| Problema | Solução |
 |---|---|
-| Não dá pra verificar a senha no servidor | Capturar login/senha **na UI** e perguntar `OK/FAIL` ao seu servidor |
-| O MAC da ServerList não pode ser forjado | Trocar o compare pra um valor **MAGIC** conhecido contar como MAC válido |
+| A assinatura da ServerList não pode ser forjada | O loader desvia a comparação de 32 bytes para um code cave que aceita um marcador **MAGIC** conhecido |
+| O servidor não lê a conta no pacote de login | O próprio loader manda login/senha ao validador do seu servidor |
+| Chave Blowfish de sessão | Lado servidor: um Init de 37 bytes que faz o `lu4.bin` instalar a chave que o servidor espera |
 
-O "raio de impacto" é mínimo: só a chamada de login e o compare de 32 bytes da lista são
-tocados; todo o resto do cliente roda byte-a-byte como antes.
+O patch mexe só na comparação de 32 bytes; todas as outras comparações do cliente seguem byte a
+byte como antes.
 
 ---
 
 ## Como funciona
 
-### Hook 1 — captura e validação do login
-- **Ponto de hook:** `ConnectToLoginServer` no RVA `0x4BB1850`,
-  assinatura `void __fastcall(this, FString* login /*rdx*/, FString* senha /*r8*/)`.
-  Um `FString` é `{ TCHAR* Data; int32 Num; int32 Max }` em UTF-16LE.
-- O hook lê as duas strings e abre um socket TCP para o **validador**, enviando:
+### 1. Iniciar o cliente
+- Login/senha vêm de `--id`/`--pwd`, senão do `lu4loader.ini`, senão o loader pergunta (o GUI usa
+  as contas salvas). São obrigatórios: o servidor precisa recebê-los do loader.
+- Com `LocalDev=1` (e Admin) ele monta a rede local com `netsh`: alias de loopback
+  `LoginIp/255.255.255.255`, portproxy `0.0.0.0:LoginPort → 127.0.0.1:AuthPort` e
+  `LoginIp:LoginPort → 127.0.0.1:AuthPort`.
+- Inicia o `lu4.bin` **direto** (não pelo launcher oficial, que também carrega o módulo
+  `clmods64`) com `GameArgs` (`LU4 -USEALLAVAILABLECORES`), mais `-ID <login> -PWD <senha>` quando
+  `AutoFillLogin=1`, para o cliente preencher o formulário de login.
+
+### 2. Validação da assinatura da ServerList (patch tardio)
+- Espera o cliente carregar (working set acima de `WaitMB`, padrão 1500 MB, até 2 min) e pega a
+  base do módulo.
+- A comparação no RVA **`0xBFEEA0`** (`__int64 __fastcall(buf1 rcx, buf2 rdx, len r8)`, `0` quando
+  iguais) só fica legível depois que o protetor decifra a página dela. O loader espera o prólogo
+  ser `48 31 C0 4D 31 D2` e então:
+  - aloca um code cave de 63 bytes no cliente (`VirtualAllocEx`, RWX);
+  - escreve um `jmp [rip+0]` de 14 bytes na comparação, apontando para o cave.
+- O cave devolve *igual* quando `len == 32` e um dos buffers começa com `LU4-MAGI` (o marcador
+  `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` que o seu servidor escreve no lugar da assinatura); fora isso
+  compara byte a byte (`0` iguais, `1` diferentes), exatamente como a original.
+- Enquanto o cliente roda, o loader reaplica o `jmp` se o prólogo original voltar.
+
+### 3. Ponte de credenciais
+- Logo depois do patch ele abre uma conexão TCP com o validador (`ValidatorHost:ValidatorPort`,
+  padrão `127.0.0.1:27110`) e manda:
   ```
   AUTH\t<login>\t<senha>\n
   ```
-  e espera `OK` (libera) ou `FAIL` (nega). Liberando, chama a função original (o login segue com
-  aquela conta); negando, mostra *"Login ou senha incorretos."* e bloqueia.
-- **Fail-open:** se o validador estiver inacessível, o hook **libera** o login (pro cliente nunca
-  travar num validador morto). Inverta o padrão em `validar()` pra fail-closed.
-- Pra evitar corrida com o auto-login do launcher (o cliente pode auto-logar *antes* do hook
-  instalar), a DLL também lê `-ID`/`-PWD` da própria linha de comando no install e valida dali.
-
-### Hook 2 — bypass do MAC da ServerList
-- **Ponto de hook:** um compare de tempo constante no RVA `0xBFEEA0`,
-  `__int64 __fastcall(buf1 rcx, buf2 rdx, len r8)` → `0` quando iguais.
-- É substituído inteiro por uma versão que faz o **mesmo** compare byte-a-byte, exceto: quando
-  `len == 32` e um dos buffers é igual ao MAGIC
-  `LU4-MAGIC-SERVERLIST-MAC-BYPASS!`, retorna `0` (iguais). O seu AuthServer põe esse MAGIC no
-  lugar onde iria o MAC real de 32 bytes, e o cliente aceita a sua lista dinâmica.
-
-### Launcher
-- **`lu4launcher_gui.exe`** — janela Win32 tema escuro: escolher/salvar/remover contas e clicar
-  **JOGAR**. As contas ficam em `lu4accounts.dat` ao lado do exe (senha com ofuscação XOR —
-  ofuscação leve, **não** é segurança).
-- **`lu4launcher.exe`** — versão console (pede login/senha, ou lê de args/ini).
-- Ao iniciar, ambos: (opcional, dev local) montam loopback + portproxy, iniciam o cliente com
-  `LU4 -USEALLAVAILABLECORES -ID <login> -PWD <senha>`, esperam ~1,2 s e injetam a
-  `lu4authhook.dll` via `LoadLibraryW` remoto.
-
-### Loader sem DLL (`lu4loader`, cliente de 18-10-2026)
-Para o build **`lu4.bin`** do cliente. Nada é injetado, e o launcher oficial (com o módulo
-`clmods64` que ele carrega) não é usado.
-- **`lu4loader_gui.exe`** — janela com contas salvas (`lu4loader_accounts.dat`, senha ofuscada com
-  XOR, **não** é segurança). **`lu4loader.exe`** — versão de console.
-- O que faz: pega login/senha (`--id`/`--pwd`, `lu4loader.ini`, ou pergunta); no dev local monta o
-  loopback + portproxy; inicia o `lu4.bin` direto com `LU4 -USEALLAVAILABLECORES` (mais `-ID`/`-PWD`
-  quando `AutoFillLogin=1`); espera o cliente carregar (working set acima de `WaitMB`); desvia a
-  comparação de 32 bytes da serverlist para um pequeno code cave que aceita o marcador de MAC do
-  servidor; manda `AUTH	<login>	<senha>
-` para o validador de credenciais do servidor
-  (porta 27110) e o renova enquanto a janela estiver aberta.
-- **Precisa de um servidor compatível.** O servidor tem que mandar o Init de 37 bytes do `lu4.bin`,
-  que faz o cliente instalar a chave Blowfish de sessão que o servidor espera (`kInitHex` do
-  AuthGateD em [Open_LU4_L2OFF, branch `Cliente-18-10-2026`](https://github.com/luannbr/Open_LU4_L2OFF/tree/Cliente-18-10-2026),
-  `AuthGateD/src/Lu4Login.cpp`). Sem ele o login decifra lixo, com ou sem loader. O servidor também
-  precisa do AuthD com `Lu4Mode=true` e o validador na 27110 (credenciais reaproveitáveis dentro do
-  TTL, para relogar sem reabrir o cliente) e da porta de login LU4 (2107) alcançável a partir de
-  `LoginIp:LoginPort`.
-- Config: copie `dist/lu4loader.ini.example` para `lu4loader.ini` ao lado do exe. Nunca comite.
-- Compilar: `src/build_lu4loader.bat` (as duas versões).
-- Estado: login verificado de ponta a ponta com o protótipo em Python deste loader; a versão em C é
-  um porte dele, com os mesmos bytes de patch e a mesma mensagem ao validador.
+  Resposta começando com `OK` = aceito; qualquer outra aparece como rejeitada.
+- O servidor guarda esse par para o IP do cliente e usa quando o login chega. O loader manda de
+  novo a cada 2 minutos enquanto a janela dele estiver aberta, então o par não expira.
+- Deixe a janela do loader aberta durante o login.
 
 ---
 
 ## Requisitos
 
 - **Windows x64.**
-- Um **build do cliente LU4** compatível — os RVAs acima são específicos de um build do
-  `lu4-win64-shipping.exe` (ver [RVAs](#os-rvas-são-específicos-do-build)).
-- O **seu lado servidor** precisa implementar o contrato abaixo (este repo é só cliente).
-- Para **compilar:** Visual Studio 2022 (C/C++, x64 — `vcvars64.bat`).
-- **Admin** só é necessário pro setup de rede do dev local (`LocalDev=1`).
+- O build **`lu4.bin`** do cliente de 18-10-2026 — o RVA é específico dele (veja
+  [RVAs](#os-rvas-são-específicos-do-build)).
+- **Um servidor que implemente o contrato abaixo** — este repo é só do lado cliente.
+- Para **compilar do fonte:** Visual Studio 2022 (C, x64 — `vcvars64.bat`).
+- **Admin** só é necessário para o setup de rede do dev local (`LocalDev=1`).
 
 ---
 
 ## Contrato do lado servidor (o que o seu emulador precisa oferecer)
 
-Este repo **não** contém o servidor. Qualquer emulador de auth/game compatível (por ex. um
-servidor estilo L2J/Lucera) precisa oferecer:
+Este repo **não** contém o servidor. O servidor de referência é o
+[Open_LU4_L2OFF, branch `Cliente-18-10-2026`](https://github.com/luannbr/Open_LU4_L2OFF/tree/Cliente-18-10-2026).
+Qualquer servidor usado com este loader precisa oferecer:
 
-1. **Um validador** escutando em `127.0.0.1:27110` (configurável) que fala o protocolo de linha:
-   - recebe `AUTH\t<login>\t<senha>\n`
-   - responde `OK` (ou `OK ...`) pra liberar, `FAIL` (ou `FAIL ...`) pra negar.
-   - (Implementação típica: hash whirlpool2 comparado com a tabela `accounts`, auto-criar opcional.)
-2. **Uma lista de servidores do AuthServer** que escreve o MAGIC de 32 bytes
-   `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` no lugar do MAC real por pacote. O Hook 2 então aceita, e
-   você serve uma lista dinâmica dos **seus** servidores, com nomes reais.
+1. **O Init de 37 bytes do `lu4.bin`** (no Open_LU4_L2OFF: `kInitHex` em
+   `AuthGateD/src/Lu4Login.cpp`). O `lu4.bin` lê a chave Blowfish de sessão nos bytes 21..36 dessa
+   mensagem; o servidor tem que decifrar com a mesma chave. **Sem ele o login decifra lixo, com ou
+   sem o loader.**
+2. **Uma ServerList com o marcador MAGIC** — os 32 bytes `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` onde
+   vai a assinatura real, para a comparação desviada aceitar a sua lista.
+3. **Um validador de credenciais** em TCP `27110` (configurável) com o protocolo de linha:
+   - recebe `AUTH\t<login>\t<senha>\n`;
+   - responde `OK` (ou `OK ...`) para aceitar, qualquer outra coisa para rejeitar;
+   - guarda o par aceito para o IP de quem mandou e o entrega ao login vindo desse IP. No
+     Open_LU4_L2OFF isso é o AuthD com `Lu4Mode=true`; o par vale durante todo o TTL, então dá
+     para relogar sem reabrir o cliente.
+4. **A porta de login LU4** (AuthGateD `lu4Port`, padrão `2107`) alcançável a partir de
+   `LoginIp:LoginPort` — pelo portproxy no dev local, ou direto em produção.
 
 ---
 
 ## Instalar e usar (usuário final)
 
-1. Coloque `lu4launcher_gui.exe` (e `lu4launcher.exe`), `lu4authhook.dll`, `inject.exe` e
-   `Inject-LU4.ps1` da pasta **`dist/`** na pasta do seu cliente (ao lado do diretório `lu4\`).
-2. Copie `lu4launcher.ini.example` para `lu4launcher.ini` e edite (IP/portas do servidor, ou só
-   os defaults pro dev local). **Nunca comite o seu `lu4launcher.ini` real.**
-3. Garanta que o **seu servidor + validador** estão no ar.
-4. Rode `lu4launcher_gui.exe`, adicione uma conta e clique **JOGAR**.
-   - Com `LocalDev=1`, rode o launcher **como Administrador** na primeira vez (ele adiciona o
-     alias de loopback + portproxy via `netsh`).
-
-### Injeção manual (sem o launcher)
-Abra o cliente, fique na tela de login e então:
-```powershell
-powershell -ExecutionPolicy Bypass -File dist\Inject-LU4.ps1
-```
-O `Inject-LU4.ps1` acha o processo do **jogo** (`lu4-win64-shipping.exe` sem `--type=`, o de
-maior working set — ou seja, não os filhos CEF da UI) e roda `inject.exe <pid> lu4authhook.dll`.
+1. Coloque `lu4loader_gui.exe` (e/ou `lu4loader.exe`) de **`dist/`** na pasta do cliente (ao lado
+   da pasta `lu4\`).
+2. Copie `lu4loader.ini.example` para `lu4loader.ini` e edite (IP/portas do servidor, ou só os
+   defaults pro dev local). **Nunca comite o seu `lu4loader.ini` real.**
+3. Garanta que o **servidor + validador** estão rodando.
+4. Rode o `lu4loader_gui.exe`, adicione uma conta e clique em **JOGAR**.
+   - Com `LocalDev=1`, rode o loader **como Administrador** (ele cria o alias de loopback + o
+     portproxy com `netsh`).
+   - No console: `lu4loader.exe` ou `lu4loader.exe --id <login> --pwd <senha>`.
+5. Deixe a janela do loader aberta até entrar no jogo.
 
 ---
 
-## Configuração (`lu4launcher.ini`)
+## Configuração (`lu4loader.ini`)
 
-| Chave | Default | Significado |
+| Chave | Padrão | Significado |
 |---|---|---|
-| `GameExe` | `lu4\binaries\win64\lu4-win64-shipping.exe` | executável do cliente (relativo ou absoluto) |
-| `HookDll` | `lu4authhook.dll` | caminho da DLL do hook |
-| `GameArgs` | `LU4 -USEALLAVAILABLECORES` | args passados ao cliente |
-| `Login` / `Pass` | *(vazio)* | opcional; se preenchidos, o launcher console não pergunta (**não comitar**) |
+| `GameExe` | `lu4\binaries\win64\lu4.bin` | executável do cliente (relativo ao loader, ou absoluto) |
+| `GameArgs` | `LU4 -USEALLAVAILABLECORES` | argumentos passados ao cliente |
+| `Login` / `Pass` | *(vazio)* | opcional; se preenchido, o loader de console não pergunta (**não comite**) |
+| `AutoFillLogin` | `1` | `1` = passa `-ID`/`-PWD` para o cliente preencher o login; `0` = você digita no jogo |
 | `LocalDev` | `1` | `1` = monta loopback+portproxy (precisa Admin); `0` = conecta direto num IP real |
-| `LoginIp` | `185.29.255.102` | IP que o cliente conecta (um alias de loopback no dev) |
+| `LoginIp` | `185.29.255.102` | IP ao qual o cliente conecta (um alias de loopback no dev) |
 | `LoginPort` | `2108` | porta do cliente |
-| `AuthPort` | `2107` | porta do seu AuthServer (destino do portproxy no dev) |
+| `AuthPort` | `2107` | porta LU4 do seu AuthGateD (destino do portproxy no dev) |
+| `ValidatorHost` | `127.0.0.1` | host do validador de credenciais |
+| `ValidatorPort` | `27110` | porta do validador de credenciais |
+| `WaitMB` | `1500` | working set do cliente (MB) a esperar antes do patch |
+
+O GUI guarda as contas em `lu4loader_accounts.dat` ao lado do exe (uma linha
+`login<TAB>senha` por conta, senha ofuscada com XOR — **não** é segurança).
 
 ---
 
 ## Compilar do fonte
 
 ```bat
-:: DLL do hook (x64)
-src\build_hook.bat
+:: console + GUI
+src\build_lu4loader.bat
 :: ou direto:
-cl /nologo /LD /O2 /EHsc /std:c++17 src\lu4authhook.cpp /Fe:lu4authhook.dll ^
-   /link ws2_32.lib user32.lib
-
-:: injetor
-cl /nologo /O2 /EHsc src\inject.cpp /Fe:inject.exe
-
-:: launcher (console + GUI)
-src\build_launcher.bat
+cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader.c /Fe:lu4loader.exe ^
+   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib
+cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader_gui.c /Fe:lu4loader_gui.exe ^
+   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib
 ```
-Os `build_*.bat` chamam o `vcvars64.bat` de um caminho padrão do VS2022 — ajuste pro seu.
+O `build_lu4loader.bat` chama o `vcvars64.bat` num caminho padrão do VS2022 — ajuste para a sua
+instalação. O manifesto de Common Controls do GUI vai embutido por `#pragma`, então não precisa
+de arquivo `.manifest`.
 
 ---
 
 ## Os RVAs são específicos do build
 
-Os offsets estão amarrados a **um** build do `lu4-win64-shipping.exe`. Se o cliente atualizar,
-re-localize antes de usar a DLL:
+O offset está amarrado a **um** build do `lu4.bin`. Se o cliente atualizar, ache de novo antes de
+usar o loader:
 
-- **Login** `0x4BB1850` — prólogo esperado:
-  `48 89 5C 24 08 57 48 83 EC 20 83 7A 08 01`
-- **Compare da ServerList** `0xBFEEA0` — uma função pequena e autocontida, estilo `memcmp` de
-  tempo constante.
+- **Comparação da ServerList** `0xBFEEA0` — uma pequena função de comparação em tempo constante,
+  estilo `memcmp`; prólogo esperado depois de decifrada: `48 31 C0 4D 31 D2`
+  (`xor rax,rax; xor r10,r10`).
 
-Edite `LOGIN_RVA` / `CMP_RVA` em `src/lu4authhook.cpp` e recompile.
+Edite `CMP_RVA` (e `ORIG` se o prólogo mudar) **nos dois** fontes, `src/lu4loader.c` e
+`src/lu4loader_gui.c`, e recompile.
+
+---
+
+## Estado
+
+O login foi verificado de ponta a ponta com o protótipo em Python deste loader. As versões em C
+são um porte dele, com os mesmos bytes de patch e a mesma mensagem ao validador.
 
 ---
 
@@ -211,31 +201,27 @@ Edite `LOGIN_RVA` / `CMP_RVA` em `src/lu4authhook.cpp` e recompile.
 
 ```
 dist/
-  lu4launcher_gui.exe     launcher gráfico (contas, jogar num clique)
-  lu4launcher.exe         launcher console
-  lu4launcher.ini.example modelo de config (copie para lu4launcher.ini)
-  lu4loader_gui.exe       loader sem DLL para o lu4.bin, gráfico (cliente de 18-10-2026)
-  lu4loader.exe           loader sem DLL, console
-  lu4loader.ini.example   modelo de config do loader (copie para lu4loader.ini)
+  lu4loader_gui.exe       loader gráfico (contas, jogar num clique)
+  lu4loader.exe           loader de console
+  lu4loader.ini.example   modelo de config (copie para lu4loader.ini)
 src/
-  lu4launcher.c           fonte do launcher console
-  lu4launcher_gui.c       fonte do launcher gráfico
-  build_launcher.bat      compila os dois launchers
-  lu4loader.c             fonte do loader sem DLL, console
-  lu4loader_gui.c         fonte do loader sem DLL, gráfico
-  build_lu4loader.bat     compila as duas versões do loader
+  lu4loader.c             fonte do loader de console
+  lu4loader_gui.c         fonte do loader gráfico
+  build_lu4loader.bat     compila os dois
 ```
 
 ## Notas de segurança
 
-- A senha é lida em texto puro no cliente e enviada ao validador. Na mesma máquina ela fica em
-  `127.0.0.1`. Pra um servidor **remoto**, o validador escutaria num IP público e a senha
-  trafegaria em claro — coloque TLS antes de fazer isso.
-- O `lu4accounts.dat` usa ofuscação XOR trivial, não criptografia. Trate como texto puro.
-- Injetar DLL e rodar um cliente modificado pode disparar anti-cheat em builds protegidos. Use só
-  num cliente de desenvolvimento/teste sem proteção.
+- A senha vai para o validador em texto puro. Na mesma máquina ela fica em `127.0.0.1`. Para um
+  servidor **remoto**, o validador escutaria num IP público e a senha trafegaria aberta — ponha
+  TLS antes de fazer isso.
+- `-ID`/`-PWD` põem a senha na linha de comando do cliente, visível para outros processos locais.
+  Use `AutoFillLogin=0` se isso importar.
+- `lu4loader_accounts.dat` usa ofuscação XOR trivial, não criptografia. Trate como texto puro.
+- Nunca comite `lu4loader.ini` nem `lu4loader_accounts.dat` (os dois estão no `.gitignore`).
+- Mexer na memória de um cliente pode disparar anti-cheat em ambientes protegidos. Use só com o
+  seu cliente e o seu servidor.
 
 ## Licença
 
-Ainda não há licença definida — até adicionar uma, vale o copyright padrão (todos os direitos
-reservados). Adicione um arquivo `LICENSE` (ex. MIT) se quiser que outros reutilizem livremente.
+Veja [LICENSE](LICENSE).

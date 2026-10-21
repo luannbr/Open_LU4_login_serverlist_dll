@@ -1,208 +1,196 @@
-# LU4 Login / ServerList DLL + Launcher
+# LU4 Loader — DLL-free login (client of 18-10-2026)
 
 **Languages:** **English** · [Português](README.pt-BR.md) · [LLM / agent reference](README.llm.md)
 
-> **Branch `Cliente-18-10-2026`:** for the `lu4.bin` client, which logs in with the DLL-free
-> loader (see [DLL-free loader](#dll-free-loader-lu4loader-client-of-18-10-2026)). This branch no
-> longer ships `lu4authhook.dll`, `inject.exe` or `Inject-LU4.ps1`; the hook and injection
-> sections below describe the `main` branch, where they still are. `lu4launcher` needs the DLL
-> and only works with the files from `main`.
+> **Branch `Cliente-18-10-2026`.** This branch holds only **`lu4loader`**, the DLL-free loader for
+> the **`lu4.bin`** client. The previous system for `lu4-win64-shipping.exe` (`lu4authhook.dll`, the
+> injector and `lu4launcher`) is on the
+> [`main`](https://github.com/luannbr/Open_LU4_login_serverlist_dll/tree/main) branch.
 
 Client-side tooling that lets the **LU4** game client (a *Lineage 2*–based title on Unreal
-Engine 5.4) log in to a **private / emulator server** instead of the official auth servers.
+Engine 5.4) log in to a **private / emulator server** instead of the official auth servers —
+**without injecting any DLL** into the game.
 
-It ships two things:
+It ships one tool in two versions:
 
-1. **`lu4authhook.dll`** — a DLL injected into the game process that
-   - **validates login/password against your own server** by reading the credentials in
-     plaintext from the UI (before they are encrypted), and
-   - **bypasses the ServerList MAC check** so your AuthServer can send a dynamic server list.
-2. **A launcher** (GUI + console) that creates/stores accounts, starts the client and injects
-   the hook in one click.
+1. **`lu4loader_gui.exe`** — a window with saved accounts: pick an account and click **JOGAR**.
+2. **`lu4loader.exe`** — the same loader as a console program (args, ini or prompt).
 
-> ⚠️ **Scope & disclaimer.** This is **interoperability / server-emulation tooling for
-> private servers you own and operate**, in the spirit of the long-standing L2 free-shard
-> community. It is **not** an anti-cheat bypass and does **not** defeat game-integrity
-> protection — it only touches the login handshake and the server-list signature. Use it
-> **only** with your own servers and your own client install, for learning, preservation and
-> development. Do **not** use it against official/commercial servers or to violate anyone's
-> Terms of Service or local law. You are responsible for how you use it.
+Both start the client, apply one small patch from outside the process (the ServerList signature
+check) and hand the account to your server's credential validator.
+
+> ⚠️ **Scope & disclaimer.** This is **interoperability / server-emulation tooling for private
+> servers you own and operate**, in the spirit of the long-standing L2 free-shard community. Use
+> it **only** with your own servers and your own client install, for learning, preservation and
+> development. Do **not** use it against official/commercial servers or to violate anyone's Terms
+> of Service or local law. You are responsible for how you use it.
 
 ---
 
 ## Why this exists
 
-The LU4 client encrypts the login packet with a static Blowfish key that is **virtualized by
-VMProtect** — it cannot be extracted, so an emulator cannot verify passwords the "normal" way
-(the login handshake ends up being a packet replay that accepts any password). On top of that,
-every ServerList packet from the auth server carries a **32-byte MAC** signed with a secret the
-emulator doesn't have, so a home-made server list is rejected.
+Two things stop the LU4 client from logging in to an emulator:
 
-This project solves both **on the client side**, surgically:
+- Every reply from the auth server carries a **32-byte Ed25519 signature** made with the official
+  server's private key. An emulator cannot produce it, so a home-made server list is rejected.
+- The login packet is encrypted with a **session Blowfish key** the client takes from the server's
+  Init packet, and the account block inside it cannot be read by the server.
 
-| Problem | Solution in `lu4authhook.dll` |
+The `main` branch solved this with a DLL injected into `lu4-win64-shipping.exe`. The `lu4.bin`
+client of 18-10-2026 is handled without any DLL:
+
+| Problem | Solution |
 |---|---|
-| Can't verify the password server-side | Capture login/password **in the UI** and ask your server `OK/FAIL` |
-| ServerList MAC can't be forged | Replace the compare so a known **MAGIC** value counts as a valid MAC |
+| ServerList signature can't be forged | The loader points the 32-byte compare to a code cave that accepts a known **MAGIC** marker |
+| The server can't read the account from the login packet | The loader sends login/password to your server's validator itself |
+| Session Blowfish key | Server side: a 37-byte Init that makes `lu4.bin` install the key the server expects |
 
-Blast radius is tiny: only the login call and the 32-byte server-list compare are touched; every
-other comparison in the client runs byte-for-byte as before.
+The patch touches only the 32-byte compare; every other comparison in the client runs byte for
+byte as before.
 
 ---
 
 ## How it works
 
-### Hook 1 — login capture & validation
-- **Hook point:** `ConnectToLoginServer` at RVA `0x4BB1850`,
-  signature `void __fastcall(this, FString* login /*rdx*/, FString* password /*r8*/)`.
-  An `FString` is `{ TCHAR* Data; int32 Num; int32 Max }` in UTF-16LE.
-- The hook reads the two strings, then opens a TCP socket to the **validator** and sends:
+### 1. Start the client
+- Login/password come from `--id`/`--pwd`, else from `lu4loader.ini`, else the loader asks (the
+  GUI uses its saved accounts). They are required: the server needs them from the loader.
+- With `LocalDev=1` (and Admin) it sets up the local network with `netsh`: loopback alias
+  `LoginIp/255.255.255.255`, portproxy `0.0.0.0:LoginPort → 127.0.0.1:AuthPort` and
+  `LoginIp:LoginPort → 127.0.0.1:AuthPort`.
+- Starts `lu4.bin` **directly** (not through the official launcher, which also loads the
+  `clmods64` module) with `GameArgs` (`LU4 -USEALLAVAILABLECORES`), plus `-ID <login> -PWD
+  <password>` when `AutoFillLogin=1` so the client fills its login form.
+
+### 2. ServerList signature gate (late patch)
+- Waits until the client has loaded (working set above `WaitMB`, default 1500 MB, up to 2 min),
+  then resolves the module base.
+- The compare at RVA **`0xBFEEA0`** (`__int64 __fastcall(buf1 rcx, buf2 rdx, len r8)`, `0` when
+  equal) only becomes readable after the protector decrypts its page. The loader waits until its
+  prologue is `48 31 C0 4D 31 D2`, then:
+  - allocates a 63-byte code cave in the client (`VirtualAllocEx`, RWX);
+  - writes a 14-byte `jmp [rip+0]` at the compare pointing to the cave.
+- The cave returns *equal* when `len == 32` and one buffer starts with `LU4-MAGI` (the marker
+  `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` your server writes instead of the signature); otherwise it
+  compares byte by byte (`0` equal, `1` differ), exactly like the original.
+- While the client runs, the loader re-applies the `jmp` if the original prologue comes back.
+
+### 3. Credential bridge
+- Right after the patch it opens a TCP connection to the validator (`ValidatorHost:ValidatorPort`,
+  default `127.0.0.1:27110`) and sends:
   ```
   AUTH\t<login>\t<password>\n
   ```
-  and expects `OK` (allow) or `FAIL` (deny). On allow it calls the original function (login
-  proceeds for that account); on deny it shows *"Login ou senha incorretos."* and blocks.
-- **Fail-open:** if the validator is unreachable, the hook **allows** the login (so the client
-  never hangs on a dead validator). Flip the default in `validar()` for fail-closed.
-- To avoid a race with the launcher's auto-login (the client can auto-log *before* the hook is
-  installed), the DLL also reads `-ID`/`-PWD` from its own command line at install time and
-  validates from there.
-
-### Hook 2 — ServerList MAC bypass
-- **Hook point:** a constant-time compare at RVA `0xBFEEA0`,
-  `__int64 __fastcall(buf1 rcx, buf2 rdx, len r8)` → `0` when equal.
-- It is fully replaced by a version that does the **same** byte compare, except: when
-  `len == 32` and one buffer equals the MAGIC
-  `LU4-MAGIC-SERVERLIST-MAC-BYPASS!`, it returns `0` (equal). Your AuthServer puts that MAGIC
-  where the real 32-byte MAC would go, and the client accepts your dynamic server list.
-
-### Launcher
-- **`lu4launcher_gui.exe`** — dark-themed Win32 window: pick/save/remove accounts, hit **JOGAR**.
-  Accounts are stored in `lu4accounts.dat` next to the exe (password XOR-obfuscated — light
-  obfuscation, **not** security).
-- **`lu4launcher.exe`** — console version (prompts for login/password, or reads them from args/ini).
-- On launch both: (optionally, local-dev) set up the loopback + portproxy, start the client with
-  `LU4 -USEALLAVAILABLECORES -ID <login> -PWD <password>`, wait ~1.2 s, then inject
-  `lu4authhook.dll` via a remote `LoadLibraryW`.
-
-### DLL-free loader (`lu4loader`, client of 18-10-2026)
-For the **`lu4.bin`** client build. Nothing is injected, and the official launcher (with the
-`clmods64` module it loads) is not used.
-- **`lu4loader_gui.exe`** — window with saved accounts (`lu4loader_accounts.dat`, password
-  XOR-obfuscated, **not** security). **`lu4loader.exe`** — console version.
-- What it does: takes login/password (`--id`/`--pwd`, `lu4loader.ini`, or asks); in local dev sets up
-  the loopback + portproxy; starts `lu4.bin` directly with `LU4 -USEALLAVAILABLECORES` (plus
-  `-ID`/`-PWD` when `AutoFillLogin=1`); waits until the client has loaded (working set above
-  `WaitMB`); redirects the 32-byte serverlist compare to a small code cave that accepts the server's
-  MAC marker; sends `AUTH	<login>	<password>
-` to the server's credential validator
-  (port 27110) and keeps refreshing it while the window is open.
-- **Needs a matching server.** The server must send the 37-byte Init for `lu4.bin`, which makes the
-  client install the session Blowfish key the server expects (AuthGateD `kInitHex` in
-  [Open_LU4_L2OFF, branch `Cliente-18-10-2026`](https://github.com/luannbr/Open_LU4_L2OFF/tree/Cliente-18-10-2026),
-  `AuthGateD/src/Lu4Login.cpp`). Without it the login decrypts to garbage, loader or not. The
-  server also needs AuthD `Lu4Mode=true` with the validator on 27110 (credentials reusable within
-  their TTL, so the client can log in again without restarting) and its LU4 login port (2107)
-  reachable from `LoginIp:LoginPort`.
-- Config: copy `dist/lu4loader.ini.example` to `lu4loader.ini` next to the exe. Never commit it.
-- Build: `src/build_lu4loader.bat` (both versions).
-- Status: login verified end to end with the Python prototype of this loader; the C version is a
-  port of it with the same patch bytes and validator message.
+  A reply starting with `OK` means accepted; anything else is shown as rejected.
+- The server keeps that pair for the client's IP and uses it when the login arrives. The loader
+  sends it again every 2 minutes while its window is open, so the pair never expires.
+- Keep the loader window open during the login.
 
 ---
 
 ## Requirements
 
 - **Windows x64.**
-- A matching **LU4 client build** — the RVAs above are specific to one
-  `lu4-win64-shipping.exe` build (see [RVAs](#rvas-are-build-specific)).
-- **Your server side** must implement the contract below (this repo is client-side only).
-- To **build from source:** Visual Studio 2022 (C/C++, x64 — `vcvars64.bat`).
+- The **`lu4.bin`** client build of 18-10-2026 — the RVA is specific to it (see
+  [RVAs](#rvas-are-build-specific)).
+- **A server that implements the contract below** — this repo is client-side only.
+- To **build from source:** Visual Studio 2022 (C, x64 — `vcvars64.bat`).
 - **Admin** is only needed for the local-dev network setup (`LocalDev=1`).
 
 ---
 
 ## Server-side contract (what your emulator must provide)
 
-This repo does **not** contain the server. Any compatible auth/game emulator (e.g. an
-L2J/Lucera-style server) must provide:
+This repo does **not** contain the server. The reference server is
+[Open_LU4_L2OFF, branch `Cliente-18-10-2026`](https://github.com/luannbr/Open_LU4_L2OFF/tree/Cliente-18-10-2026).
+Any server used with this loader must provide:
 
-1. **A validator** listening on `127.0.0.1:27110` (configurable) that speaks the line protocol:
-   - receives `AUTH\t<login>\t<password>\n`
-   - replies `OK` (or `OK ...`) to allow, `FAIL` (or `FAIL ...`) to deny.
-   - (Typical impl: whirlpool2 hash compared against the `accounts` table, auto-create optional.)
-2. **An AuthServer server list** that writes the 32-byte MAGIC
-   `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` in place of the real per-packet MAC. The DLL's Hook 2 then
-   accepts it, so you can serve a dynamic list of **your** servers with real names.
+1. **The 37-byte Init for `lu4.bin`** (in Open_LU4_L2OFF: `kInitHex` in
+   `AuthGateD/src/Lu4Login.cpp`). `lu4.bin` reads the session Blowfish key at bytes 21..36 of that
+   message; the server must then decrypt with the same key. **Without it the login decrypts to
+   garbage, with or without the loader.**
+2. **A ServerList with the MAGIC marker** — the 32 bytes `LU4-MAGIC-SERVERLIST-MAC-BYPASS!` where
+   the real signature goes, so the patched compare accepts your list.
+3. **A credential validator** on TCP `27110` (configurable) that speaks the line protocol:
+   - receives `AUTH\t<login>\t<password>\n`;
+   - replies `OK` (or `OK ...`) to accept, anything else to reject;
+   - keeps the accepted pair for the sender's IP and hands it to the login from that IP. In
+     Open_LU4_L2OFF this is AuthD with `Lu4Mode=true`; the pair stays valid for its whole TTL, so
+     the client can log in again without restarting.
+4. **The LU4 login port** (AuthGateD `lu4Port`, default `2107`) reachable from
+   `LoginIp:LoginPort` — through the portproxy in local dev, or directly in production.
 
 ---
 
 ## Install & use (end user)
 
-1. Put `lu4launcher_gui.exe` (and `lu4launcher.exe`), `lu4authhook.dll`, `inject.exe` and
-   `Inject-LU4.ps1` from **`dist/`** into your client folder (next to the `lu4\` directory).
-2. Copy `lu4launcher.ini.example` to `lu4launcher.ini` and edit it (server IP/ports, or just the
-   defaults for local dev). **Never commit your real `lu4launcher.ini`.**
+1. Put `lu4loader_gui.exe` (and/or `lu4loader.exe`) from **`dist/`** into your client folder (next
+   to the `lu4\` directory).
+2. Copy `lu4loader.ini.example` to `lu4loader.ini` and edit it (server IP/ports, or just the
+   defaults for local dev). **Never commit your real `lu4loader.ini`.**
 3. Make sure your **server + validator** are running.
-4. Run `lu4launcher_gui.exe`, add an account, and click **JOGAR**.
-   - For `LocalDev=1`, run the launcher **as Administrator** the first time (it adds the loopback
-     alias + portproxy with `netsh`).
-
-### Manual injection (without the launcher)
-Start the client, stay on the login screen, then:
-```powershell
-powershell -ExecutionPolicy Bypass -File dist\Inject-LU4.ps1
-```
-`Inject-LU4.ps1` finds the **game** process (`lu4-win64-shipping.exe` without `--type=`, largest
-working set — i.e. not the CEF UI children) and runs `inject.exe <pid> lu4authhook.dll`.
+4. Run `lu4loader_gui.exe`, add an account, and click **JOGAR**.
+   - For `LocalDev=1`, run the loader **as Administrator** (it adds the loopback alias +
+     portproxy with `netsh`).
+   - Console instead: `lu4loader.exe` or `lu4loader.exe --id <login> --pwd <password>`.
+5. Keep the loader window open until you are in the game.
 
 ---
 
-## Configuration (`lu4launcher.ini`)
+## Configuration (`lu4loader.ini`)
 
 | Key | Default | Meaning |
 |---|---|---|
-| `GameExe` | `lu4\binaries\win64\lu4-win64-shipping.exe` | client executable (relative or absolute) |
-| `HookDll` | `lu4authhook.dll` | hook DLL path |
+| `GameExe` | `lu4\binaries\win64\lu4.bin` | client executable (relative to the loader, or absolute) |
 | `GameArgs` | `LU4 -USEALLAVAILABLECORES` | args passed to the client |
-| `Login` / `Pass` | *(empty)* | optional; if set, console launcher won't prompt (**don't commit**) |
+| `Login` / `Pass` | *(empty)* | optional; if set, the console loader won't prompt (**don't commit**) |
+| `AutoFillLogin` | `1` | `1` = pass `-ID`/`-PWD` so the client fills its login form; `0` = type it in the game |
 | `LocalDev` | `1` | `1` = set up loopback+portproxy (needs Admin); `0` = connect straight to a real IP |
 | `LoginIp` | `185.29.255.102` | IP the client connects to (a loopback alias in dev) |
 | `LoginPort` | `2108` | client port |
-| `AuthPort` | `2107` | your AuthServer port (portproxy target in dev) |
+| `AuthPort` | `2107` | your AuthGateD LU4 port (portproxy target in dev) |
+| `ValidatorHost` | `127.0.0.1` | credential validator host |
+| `ValidatorPort` | `27110` | credential validator port |
+| `WaitMB` | `1500` | client working set (MB) to wait for before patching |
+
+The GUI stores its accounts in `lu4loader_accounts.dat` next to the exe (one `login<TAB>password`
+line each, password XOR-obfuscated — **not** security).
 
 ---
 
 ## Build from source
 
 ```bat
-:: hook DLL (x64)
-src\build_hook.bat
+:: console + GUI
+src\build_lu4loader.bat
 :: or directly:
-cl /nologo /LD /O2 /EHsc /std:c++17 src\lu4authhook.cpp /Fe:lu4authhook.dll ^
-   /link ws2_32.lib user32.lib
-
-:: injector
-cl /nologo /O2 /EHsc src\inject.cpp /Fe:inject.exe
-
-:: launcher (console + GUI)
-src\build_launcher.bat
+cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader.c /Fe:lu4loader.exe ^
+   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib
+cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader_gui.c /Fe:lu4loader_gui.exe ^
+   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib
 ```
-The `build_*.bat` files call `vcvars64.bat` from a default VS2022 path — adjust it to your install.
+`build_lu4loader.bat` calls `vcvars64.bat` from a default VS2022 path — adjust it to your install.
+The GUI's Common Controls manifest is embedded with a `#pragma`, so no `.manifest` file is needed.
 
 ---
 
 ## RVAs are build-specific
 
-The offsets are tied to **one** `lu4-win64-shipping.exe` build. If the client updates, re-locate
-them before using the DLL:
+The offset is tied to **one** `lu4.bin` build. If the client updates, re-locate it before using
+the loader:
 
-- **Login** `0x4BB1850` — expected prologue:
-  `48 89 5C 24 08 57 48 83 EC 20 83 7A 08 01`
 - **ServerList compare** `0xBFEEA0` — a small, self-contained constant-time `memcmp`-style
-  function.
+  function; expected prologue once decrypted: `48 31 C0 4D 31 D2` (`xor rax,rax; xor r10,r10`).
 
-Edit `LOGIN_RVA` / `CMP_RVA` in `src/lu4authhook.cpp` and rebuild.
+Edit `CMP_RVA` (and `ORIG` if the prologue changes) in **both** `src/lu4loader.c` and
+`src/lu4loader_gui.c`, then rebuild.
+
+---
+
+## Status
+
+The login was verified end to end with the Python prototype of this loader. The C versions are a
+port of it with the same patch bytes and the same validator message.
 
 ---
 
@@ -210,31 +198,27 @@ Edit `LOGIN_RVA` / `CMP_RVA` in `src/lu4authhook.cpp` and rebuild.
 
 ```
 dist/
-  lu4launcher_gui.exe     GUI launcher (accounts, one-click play)
-  lu4launcher.exe         console launcher
-  lu4launcher.ini.example config template (copy to lu4launcher.ini)
-  lu4loader_gui.exe       DLL-free loader for lu4.bin, GUI (client of 18-10-2026)
-  lu4loader.exe           DLL-free loader, console
-  lu4loader.ini.example   loader config template (copy to lu4loader.ini)
+  lu4loader_gui.exe       GUI loader (accounts, one-click play)
+  lu4loader.exe           console loader
+  lu4loader.ini.example   config template (copy to lu4loader.ini)
 src/
-  lu4launcher.c           console launcher source
-  lu4launcher_gui.c       GUI launcher source
-  build_launcher.bat      builds both launchers
-  lu4loader.c             DLL-free loader source, console
-  lu4loader_gui.c         DLL-free loader source, GUI
-  build_lu4loader.bat     builds both loader versions
+  lu4loader.c             console loader source
+  lu4loader_gui.c         GUI loader source
+  build_lu4loader.bat     builds both
 ```
 
 ## Security notes
 
-- The password is read in plaintext in the client and sent to the validator. On the same machine
-  it stays on `127.0.0.1`. For a **remote** server the validator would listen on a public IP and
-  the password would travel in clear — add TLS before doing that.
-- `lu4accounts.dat` uses trivial XOR obfuscation, not encryption. Treat it as plaintext.
-- Injecting a DLL and running a modded client can trip anti-cheat on protected builds. Only use
-  this on an unprotected development/test client.
+- The password is sent to the validator in plaintext. On the same machine it stays on
+  `127.0.0.1`. For a **remote** server the validator would listen on a public IP and the password
+  would travel in clear — add TLS before doing that.
+- `-ID`/`-PWD` put the password on the client's command line, visible to other local processes.
+  Use `AutoFillLogin=0` if that matters.
+- `lu4loader_accounts.dat` uses trivial XOR obfuscation, not encryption. Treat it as plaintext.
+- Never commit `lu4loader.ini` or `lu4loader_accounts.dat` (both are in `.gitignore`).
+- Patching a client's memory can trip anti-cheat on protected setups. Use this only with your own
+  client and your own server.
 
 ## License
 
-No license is set yet — until one is added, default copyright (all rights reserved) applies.
-Add a `LICENSE` file (e.g. MIT) if you want others to reuse it freely.
+See [LICENSE](LICENSE).
