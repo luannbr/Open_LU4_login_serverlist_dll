@@ -40,7 +40,19 @@ Constants (build-specific; `base` = first module of the client process via `Enum
   checks the first 8 bytes `4C 55 34 2D 4D 41 47 49`.
 - Defaults: `GameExe lu4\binaries\win64\lu4.bin`, `GameArgs LU4 -USEALLAVAILABLECORES`,
   `LoginIp 185.29.255.102`, `LoginPort 2108`, `AuthPort 2107`, `ValidatorHost 127.0.0.1`,
-  `ValidatorPort 27110`, `LocalDev 1`, `AutoFillLogin 1`, `WaitMB 1500`.
+  `ValidatorPort 27110`, `GamePort 7778`, `LocalDev 1`, `AutoFillLogin 1`, `DisconnectGuard 0`,
+  `WaitMB 1500`.
+- `DisconnectGuard` (`lu4_disconnect_guard.h`, `installDisconnectGuard(process, base, &counter)`;
+  off by default): fixes the client's idle self-disconnect. Target `Disconnect = base+0x4CE8C60`
+  (prologue `48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20`), watchdog call-site
+  `caller = base+0x915B3F3`, build fingerprint getter `base+0x4D01A90` (`48 8B 05 89 75 6C 03 C3`).
+  It `VirtualAllocEx`es 2 pages (page0 = RX trampoline, page1 = u64 call counter), rewrites the
+  `Disconnect` prologue with a 15-byte `FF 25 <rip+0> <remote u64>; nop`. Trampoline: `mov
+  rax,[rsp]` (Disconnect is reached by JMP, so `[rsp]` is still the caller's return addr); if it
+  equals `caller`, `lock inc [counter]` then `ret` — swallows the watchdog's disconnect; otherwise
+  run the original 15 bytes and `jmp Disconnect+15` — relog/logout pass through. Returns `1` ok, or
+  `-1`(getter mismatch)/`-2`(prologue mismatch)/`-3..-8` (alloc/write/protect/flush) without
+  corrupting the client. The allocation is kept until the client exits (a call may be in flight).
 
 Flow (`main`):
 1. `loadConfig()` from `lu4loader.ini` next to the exe (flat `key=value`, `#`/`;` comments, paths
@@ -53,15 +65,24 @@ Flow (`main`):
 4. `CreateProcessA("<GameExe>" <GameArgs> [-ID <login> -PWD <pass>])`, cwd = client exe dir. The
    official launcher (`lu4.exe`, which loads `clmods64.dll`) is not used.
 5. Wait up to 120 s for working set ≥ `WaitMB` (late patch: writing `.text` early trips the
-   VMProtect integrity check; `0xBFEEA0` is not covered by it, `0x600b020` is).
-6. Loop every 300 ms until the client exits:
-   - not installed → `patchCave()`: read 6 bytes at `base+CMP_RVA`, require `ORIG`;
-     `VirtualAllocEx(0x400, RWX)`; write `CAVE`; `VirtualProtectEx` + write 14-byte
-     `FF 25 00 00 00 00 <cave u64>`; then `sendBridge()`.
-   - installed → `reapplyJmp()` if the first 2 bytes are `ORIG` again; `sendBridge()` every 120 s.
+   VMProtect integrity check; `0xBFEEA0` is not covered by it, `0x600b020` is). Resolve `base`.
+6. Loop every 300 ms, tracking `inWorld` via `clientInGame(pid, GamePort)` (an ESTABLISHED TCP
+   connection to `GamePort` = in-world). Client exit ends the loop.
+   - **Auth/server-list** (`!inWorld`, handle open): if no cave → `patchCave()` (read 16 bytes at
+     `base+CMP_RVA`, require `ORIG`, save them for restore; `VirtualAllocEx(0x400, RWX)`; write
+     `CAVE`; write 14-byte `FF 25 00000000 <cave u64>`) then `sendBridge()`. If cave present →
+     `reapplyJmp()` and refresh `sendBridge()` every 120 s.
+   - **Entering world** (first `inWorld`): if `DisconnectGuard=1` and not yet attempted →
+     `installDisconnectGuard()` once (logged with its result + counter addr). Then `restoreOrig()`
+     (undo the MAC jmp), `VirtualFreeEx` the cave, and `CloseHandle` — so the client's anti-tamper
+     finds no RWX page / no external VM_WRITE handle. The MAC compare is only used at auth, so the
+     patch must leave; the guard (if installed) stays and is what holds the connection.
+   - **Leaving world** (relog): after ~10 ticks of `!inGame`, `OpenProcess` again (if it fails the
+     client exited → stop) and resume re-patching the MAC for the next login.
 7. `sendBridge(host, port, login, pass)`: TCP connect, send `"AUTH\t<login>\t<pass>\n"`, read one
    reply; prefix `OK` → accepted, else rejected (logged). No retry on connect failure beyond the
-   120 s refresh.
+   120 s refresh. All state transitions are timestamped to `lu4loader.log` (`lu4loader_gui.log` for
+   the GUI).
 
 GUI specifics (`lu4loader_gui.c`):
 - Accounts in `lu4loader_accounts.dat` (lines `login\t<xorhex(pass)>`), XOR key
@@ -90,8 +111,8 @@ Reference: Open_LU4_L2OFF, branch `Cliente-18-10-2026`
 ## 6. Build (Windows x64, VS2022)
 ```
 src\build_lu4loader.bat
-# cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS lu4loader.c     /Fe:lu4loader.exe     (+ user32 advapi32 shell32 psapi ws2_32)
-# cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS lu4loader_gui.c /Fe:lu4loader_gui.exe (+ gdi32 comctl32)
+# cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS lu4loader.c     /Fe:lu4loader.exe     (+ user32 advapi32 shell32 psapi ws2_32 iphlpapi)
+# cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS lu4loader_gui.c /Fe:lu4loader_gui.exe (+ gdi32 comctl32 iphlpapi)
 ```
 `build_lu4loader.bat` calls a hardcoded `vcvars64.bat` path (VS2022 Community) — adjust per
 machine.
@@ -103,6 +124,10 @@ machine.
 - Make sure the new site is outside the VMProtect integrity-checked region (patch late).
 - Rebuild. Verify from the console output: `[OK] cave @ ...; compare 0xBFEEA0 redirecionado.`,
   `[bridge] validator ... -> 'OK'`.
+- `DisconnectGuard` has its own build-specific offsets in `lu4_disconnect_guard.h` (`Disconnect`
+  `0x4CE8C60`, watchdog `0x915B3F3`, getter `0x4D01A90`, and the `original`/`getter` byte
+  signatures). On a new build re-locate them; a mismatch makes `installDisconnectGuard` return
+  `-1`/`-2` and no-op (logged), so a stale offset fails safe rather than corrupting the client.
 
 ## 8. Known caveats / status
 - Verified end to end with the Python prototype (`loader_cave.py` + `lu4_cred_bridge.py`, not in

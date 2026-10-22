@@ -87,6 +87,27 @@ byte como antes.
   novo a cada 2 minutos enquanto a janela dele estiver aberta, então o par não expira.
 - Deixe a janela do loader aberta durante o login.
 
+### 4. DisconnectGuard — anti-queda por ociosidade (opcional, `DisconnectGuard=1`)
+- **Sintoma:** parado alguns minutos (mesmo em localhost, com o servidor saudável), o `lu4.bin`
+  **derruba a própria conexão**. Não é o servidor — o ring de pacotes fica limpo e o ping é
+  respondido até o fim. É uma rotina interna (watchdog) do build do cliente que chama o próprio
+  `Disconnect`.
+- Como o mesmo `Disconnect` é usado por relog/logout legítimos, não dá pra NOP-ar a função. Com
+  `DisconnectGuard=1`, ao entrar no mundo o loader instala de fora um **filtro seletivo** no
+  `Disconnect` do cliente (`base+0x4ce8c60`), sem DLL e sem thread remota:
+  - desvia o prólogo pra um pequeno trampolim (alocado com `VirtualAllocEx`);
+  - o trampolim compara o endereço de retorno (`[rsp]`) com o call-site do watchdog
+    (`base+0x915b3f3`): se **for** o watchdog, conta e faz `ret` imediato — a desconexão é
+    engolida; se for **qualquer outra** origem (relog, logout), executa o prólogo original e segue
+    normal.
+- **Segurança:** antes de tocar em nada ele confere um *fingerprint* do build (um getter em
+  `base+0x4d01a90`) e o prólogo esperado do `Disconnect`; em outro build ele **não instala** e loga
+  o motivo (não corrompe nada). Os RVAs são específicos deste `lu4.bin`.
+- Ao contrário do patch do MAC (removido ao entrar no mundo), o guard é **mantido** enquanto o
+  cliente roda — é ele que segura a conexão. O resultado vai pro `lu4loader.log`
+  (`DISCONNECT_GUARD ... result=1`) e, no GUI, pro status da janela. Detalhes byte a byte em
+  `src/lu4_disconnect_guard.h`.
+
 ---
 
 ## Requisitos
@@ -152,6 +173,8 @@ Qualquer servidor usado com este loader precisa oferecer:
 | `AuthPort` | `2107` | porta LU4 do seu AuthGateD (destino do portproxy no dev) |
 | `ValidatorHost` | `127.0.0.1` | host do validador de credenciais |
 | `ValidatorPort` | `27110` | porta do validador de credenciais |
+| `GamePort` | `7778` | porta do GameServer; conexão TCP estabelecida nela = "em jogo" |
+| `DisconnectGuard` | `0` | `1` = instala o filtro anti-queda por ociosidade ao entrar no mundo (veja a seção 4) |
 | `WaitMB` | `1500` | working set do cliente (MB) a esperar antes do patch |
 
 O GUI guarda as contas em `lu4loader_accounts.dat` ao lado do exe (uma linha
@@ -166,9 +189,9 @@ O GUI guarda as contas em `lu4loader_accounts.dat` ao lado do exe (uma linha
 src\build_lu4loader.bat
 :: ou direto:
 cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader.c /Fe:lu4loader.exe ^
-   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib
+   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib iphlpapi.lib
 cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader_gui.c /Fe:lu4loader_gui.exe ^
-   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib
+   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib iphlpapi.lib
 ```
 O `build_lu4loader.bat` chama o `vcvars64.bat` num caminho padrão do VS2022 — ajuste para a sua
 instalação. O manifesto de Common Controls do GUI vai embutido por `#pragma`, então não precisa
@@ -207,6 +230,7 @@ dist/
 src/
   lu4loader.c             fonte do loader de console
   lu4loader_gui.c         fonte do loader gráfico
+  lu4_disconnect_guard.h  filtro anti-queda por ociosidade (DisconnectGuard; incluído pelos dois)
   build_lu4loader.bat     compila os dois
 ```
 

@@ -6,7 +6,11 @@
  *   1. (dev local) monta loopback + portproxy via netsh (precisa Admin).
  *   2. Lanca o lu4.bin DIRETO (sem launcher oficial -> sem clmods), com -ID/-PWD (auto-fill).
  *   3. Espera o cliente carregar e aplica o cave do MAC (compare 0xBFEEA0) de fora (WPM).
- *   4. Manda as credenciais pro Lu4Validator do AuthD (bridge). Mantem o jmp + re-bridge.
+ *   4. Manda as credenciais pro Lu4Validator do AuthD (bridge). Mantem o jmp + re-bridge
+ *      durante o login; ao entrar no mundo (conexao TCP pro GamePort) desfaz tudo:
+ *      restaura os bytes do compare, libera o cave (RWX) e fecha o handle do processo
+ *      e reabre/reaplica o MAC no relog. DisconnectGuard=1 instala um filtro
+ *      seletivo de desconexao por cliente, mantido ate o processo terminar.
  *
  * Contas em lu4loader_accounts.dat (senha com XOR leve). Config em lu4loader.ini.
  *
@@ -21,10 +25,13 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <psapi.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdarg.h>
+#include "lu4_disconnect_guard.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -33,6 +40,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 /* ------------------------- config (iguais ao lu4loader.ini) ------------------------- */
@@ -43,11 +51,14 @@ static const char *DEF_LOGIN_PORT = "2108";
 static const char *DEF_AUTH_PORT  = "2107";
 static const char *DEF_VAL_HOST   = "127.0.0.1";
 static const char *DEF_VAL_PORT   = "27110";
+static const char *DEF_GAME_PORT  = "7778";
 
 static char g_dir[MAX_PATH], g_game[MAX_PATH];
 static char g_gameArgs[512], g_loginIp[64], g_loginPort[16], g_authPort[16];
-static char g_valHost[64], g_valPort[16];
+static char g_valHost[64], g_valPort[16], g_gamePort[16];
+static char g_logPath[MAX_PATH];
 static int  g_localDev = 1, g_autoFill = 1, g_waitMb = 1500;
+static int  g_disconnectGuard = 0;
 
 /* ------------------------- o gate do MAC (igual ao lu4loader.c) ------------------------- */
 #define CMP_RVA 0xBFEEA0ULL
@@ -61,6 +72,9 @@ static const unsigned char CAVE[] = {
     0x48,0xFF,0xC1, 0x48,0xFF,0xC2, 0x49,0xFF,0xC8, 0x75,0xED,
     0xEB,0x05, 0xB8,0x01,0x00,0x00,0x00, 0xC3, 0x31,0xC0, 0xC3
 };
+/* bytes originais do compare (16 B lidos antes de patchar) p/ restaurar ao entrar no mundo */
+static unsigned char g_orig[16];
+static int g_origLen = 0;
 
 /* ------------------------- contas ------------------------- */
 #define MAX_ACC 64
@@ -123,9 +137,22 @@ static void loadConfig(void){
     iniGet(ini,"AuthPort",g_authPort,sizeof(g_authPort),DEF_AUTH_PORT);
     iniGet(ini,"ValidatorHost",g_valHost,sizeof(g_valHost),DEF_VAL_HOST);
     iniGet(ini,"ValidatorPort",g_valPort,sizeof(g_valPort),DEF_VAL_PORT);
+    iniGet(ini,"GamePort",g_gamePort,sizeof(g_gamePort),DEF_GAME_PORT);
     iniGet(ini,"LocalDev",buf,sizeof(buf),"1"); g_localDev=(buf[0]=='1'||buf[0]=='t'||buf[0]=='T');
     iniGet(ini,"AutoFillLogin",buf,sizeof(buf),"1"); g_autoFill=(buf[0]=='1'||buf[0]=='t'||buf[0]=='T');
+    iniGet(ini,"DisconnectGuard",buf,sizeof(buf),"0"); g_disconnectGuard=(buf[0]=='1');
     iniGet(ini,"WaitMB",buf,sizeof(buf),"1500"); g_waitMb=atoi(buf); if(g_waitMb<1) g_waitMb=1500;
+}
+/* log com timestamp em lu4loader_gui.log (ao lado do exe): linha do tempo exata
+ * do estado do patch (entrou no mundo / restaurou / re-patchou) p/ cruzar com a
+ * hora da queda. Diagnostico -- pode sair quando o bug fechar. */
+static void logLine(const char *fmt, ...){
+    if(!g_logPath[0]) return;
+    FILE *f=fopen(g_logPath,"a"); if(!f) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(f,"%02d:%02d:%02d.%03d ",st.wHour,st.wMinute,st.wSecond,st.wMilliseconds);
+    va_list ap; va_start(ap,fmt); vfprintf(f,fmt,ap); va_end(ap);
+    fputc('\n',f); fclose(f);
 }
 
 /* ------------------------- contas: XOR+hex, load/save ------------------------- */
@@ -191,9 +218,10 @@ static size_t wsMb(HANDLE h){
     return 0;
 }
 static int patchCave(HANDLE h,unsigned long long cmp,unsigned long long*caveOut){
-    unsigned char cur[6]; SIZE_T got=0;
-    if(!ReadProcessMemory(h,(LPCVOID)cmp,cur,6,&got)||got!=6) return 0;
+    unsigned char cur[16]; SIZE_T got=0;
+    if(!ReadProcessMemory(h,(LPCVOID)cmp,cur,sizeof(cur),&got)||got!=sizeof(cur)) return 0;
     if(memcmp(cur,ORIG,6)!=0) return 0;
+    memcpy(g_orig,cur,sizeof(cur)); g_origLen=(int)sizeof(cur);
     LPVOID cave=VirtualAllocEx(h,NULL,0x400,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if(!cave) return 0;
     if(!WriteProcessMemory(h,cave,CAVE,sizeof(CAVE),NULL)) return 0;
@@ -213,6 +241,37 @@ static void reapplyJmp(HANDLE h,unsigned long long cmp,unsigned long long cave){
         WriteProcessMemory(h,(LPVOID)cmp,jmp,sizeof(jmp),NULL);
         VirtualProtectEx(h,(LPVOID)cmp,16,old,&old);
     }
+}
+/* restaura os bytes originais do compare (desfaz o jmp) ao entrar no mundo:
+ * o compare do MAC so' roda no auth; deixar o patch faz o anti-tamper do
+ * cliente reportar (api.telegram.org) e derrubar a conexao em alguns minutos. */
+static void restoreOrig(HANDLE h,unsigned long long cmp){
+    if(g_origLen<=0) return;
+    DWORD old=0;
+    if(VirtualProtectEx(h,(LPVOID)cmp,16,PAGE_EXECUTE_READWRITE,&old)){
+        WriteProcessMemory(h,(LPVOID)cmp,g_orig,(SIZE_T)g_origLen,NULL);
+        VirtualProtectEx(h,(LPVOID)cmp,16,old,&old);
+    }
+}
+/* 1 se o cliente tem conexao TCP estabelecida pro porto do GameServer (em jogo). */
+static int clientInGame(DWORD pid,unsigned short gamePort){
+    if(!gamePort) return 0;
+    DWORD sz=0; int found=0;
+    GetExtendedTcpTable(NULL,&sz,FALSE,AF_INET,TCP_TABLE_OWNER_PID_ALL,0);
+    if(!sz) return 0;
+    MIB_TCPTABLE_OWNER_PID*tbl=(MIB_TCPTABLE_OWNER_PID*)malloc(sz);
+    if(!tbl) return 0;
+    if(GetExtendedTcpTable(tbl,&sz,FALSE,AF_INET,TCP_TABLE_OWNER_PID_ALL,0)==NO_ERROR){
+        for(DWORD i=0;i<tbl->dwNumEntries;i++){
+            MIB_TCPROW_OWNER_PID*r=&tbl->table[i];
+            if(r->dwOwningPid==pid && r->dwState==MIB_TCP_STATE_ESTAB){
+                unsigned short rp=ntohs((unsigned short)(r->dwRemotePort&0xFFFF));
+                if(rp==gamePort){ found=1; break; }
+            }
+        }
+    }
+    free(tbl);
+    return found;
 }
 static int sendBridge(const char*host,const char*port,const char*login,const char*pass){
     struct addrinfo hints,*res=NULL; int ok=0;
@@ -243,7 +302,7 @@ static DWORD WINAPI launchThread(LPVOID p){
     WSADATA wsa; HANDLE h; DWORD code=STILL_ACTIVE; ULONGLONG t0;
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     char cwd[MAX_PATH], cmd[1024];
-    unsigned long long base=0, cmp=0, cave=0; int installed=0; ULONGLONG bridgeT=0;
+    unsigned long long base=0, cmp=0, cave=0; ULONGLONG bridgeT=0;
 
     if(GetFileAttributesA(g_game)==INVALID_FILE_ATTRIBUTES){ setStatus("Erro: cliente nao encontrado (veja lu4loader.ini)"); launchDone(a); return 1; }
     if(g_localDev){ if(isAdmin()){ setStatus("Configurando rede local..."); setupNetwork(); }
@@ -271,21 +330,59 @@ static DWORD WINAPI launchThread(LPVOID p){
     if(!base){ setStatus("Nao resolvi a base do cliente."); CloseHandle(h); WSACleanup(); launchDone(a); return 0; }
     cmp=base+CMP_RVA;
     setStatus("Aplicando protecao (MAC)...");
+    logLine("cliente pid %lu  base=%#llx  cmp=%#llx",pi.dwProcessId,base,cmp);
+    unsigned short gamePort=(unsigned short)atoi(g_gamePort);
+    int inWorld=0, outOfGameTicks=0;
+    int guardAttempted=0, guardResult=0;
+    const DWORD kPatchRights=PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_QUERY_INFORMATION;
     while(1){
-        if(GetExitCodeProcess(h,&code)&&code!=STILL_ACTIVE){ setStatus("Cliente encerrado."); break; }
-        if(!installed){
-            if(patchCave(h,cmp,&cave)){
-                installed=1;
-                int ok=sendBridge(g_valHost,g_valPort,a->login,a->pass); bridgeT=GetTickCount64();
-                setStatus(ok? "Pronto! Faca o login no jogo." : "Cliente aberto, mas o validator recusou/indisponivel.");
+        if(h && GetExitCodeProcess(h,&code)&&code!=STILL_ACTIVE){ setStatus("Cliente encerrado."); logLine("cliente saiu (exit %#lx)",code); break; }
+        const int nowInGame=clientInGame(pi.dwProcessId,gamePort);
+        if(nowInGame){
+            outOfGameTicks=0;
+            if(!inWorld){
+                /* Remove o patch de login; mantem o guard seletivo instalado. */
+                if(h){
+                    if(g_disconnectGuard && !guardAttempted){
+                        unsigned long long counter=0;
+                        guardResult=installDisconnectGuard(h,base,&counter);
+                        guardAttempted=1;
+                        logLine("DISCONNECT_GUARD pid=%lu result=%d base=%#llx counter=%#llx",pi.dwProcessId,guardResult,base,counter);
+                    }
+                    if(cave){ restoreOrig(h,cmp); VirtualFreeEx(h,(LPVOID)(uintptr_t)cave,0,MEM_RELEASE); logLine("EM JOGO: restaurei orig em %#llx, liberei cave %#llx",cmp,cave); cave=0; }
+                    else logLine("EM JOGO: sem cave p/ liberar (ja limpo)");
+                    CloseHandle(h); h=NULL; logLine("EM JOGO: handle do processo fechado");
+                }
+                inWorld=1;
+                setStatus(!g_disconnectGuard ? "Em jogo. DisconnectGuard desativado." :
+                    guardResult==1 ? "Em jogo. DisconnectGuard ativo." :
+                    "Em jogo. Falha ao instalar DisconnectGuard; consulte o log.");
             }
         } else {
-            reapplyJmp(h,cmp,cave);
-            if(GetTickCount64()-bridgeT>120000){ sendBridge(g_valHost,g_valPort,a->login,a->pass); bridgeT=GetTickCount64(); }
+            if(inWorld){
+                if(++outOfGameTicks>=10){
+                    inWorld=0; outOfGameTicks=0;
+                    h=OpenProcess(kPatchRights,FALSE,pi.dwProcessId); /* relog: reabre p/ re-patchar */
+                    if(!h){ setStatus("Cliente encerrado."); logLine("fora do jogo: OpenProcess falhou -> cliente saiu"); break; }
+                    logLine("FORA DO JOGO (relog): handle reaberto, vou re-patchar");
+                }
+            }
+            if(!inWorld && h){
+                if(!cave){
+                    if(patchCave(h,cmp,&cave)){
+                        logLine("patch instalado: cave=%#llx (jmp em %#llx)",cave,cmp);
+                        int ok=sendBridge(g_valHost,g_valPort,a->login,a->pass); bridgeT=GetTickCount64();
+                        setStatus(ok? "Pronto! Faca o login no jogo." : "Cliente aberto, mas o validator recusou/indisponivel.");
+                    }
+                } else {
+                    reapplyJmp(h,cmp,cave);
+                    if(GetTickCount64()-bridgeT>120000){ sendBridge(g_valHost,g_valPort,a->login,a->pass); bridgeT=GetTickCount64(); }
+                }
+            }
         }
         Sleep(300);
     }
-    CloseHandle(h); WSACleanup(); launchDone(a);
+    if(h) CloseHandle(h); WSACleanup(); launchDone(a);
     return 0;
 }
 
@@ -410,6 +507,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR cmd,int show){
     (void)hPrev;(void)cmd;(void)show;
     launcherDir(); loadConfig();
+    joinPath(g_logPath,g_dir,"lu4loader_gui.log");
+    logLine("=== loader GUI iniciado (GamePort=%s) ===",g_gamePort);
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
     hbrBg=CreateSolidBrush(COL_BG); hbrEdit=CreateSolidBrush(COL_EDIT); hbrPanel=CreateSolidBrush(COL_PANEL);
     WNDCLASSA wc; ZeroMemory(&wc,sizeof(wc));

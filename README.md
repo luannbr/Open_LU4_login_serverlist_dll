@@ -86,6 +86,27 @@ byte as before.
   sends it again every 2 minutes while its window is open, so the pair never expires.
 - Keep the loader window open during the login.
 
+### 4. DisconnectGuard — idle-drop fix (optional, `DisconnectGuard=1`)
+- **Symptom:** after a few minutes standing still (even on localhost, with a healthy server), the
+  `lu4.bin` client **drops its own connection**. It isn't the server — the packet ring stays clean
+  and the ping is answered to the very end. It's an internal routine (a watchdog) in this client
+  build that calls its own `Disconnect`.
+- Since the same `Disconnect` is used by legitimate relog/logout, the function can't just be
+  NOP-ed. With `DisconnectGuard=1`, on world entry the loader installs — from outside, with no DLL
+  and no remote thread — a **selective filter** on the client's `Disconnect` (`base+0x4ce8c60`):
+  - it redirects the prologue to a small trampoline (allocated with `VirtualAllocEx`);
+  - the trampoline compares the return address (`[rsp]`) with the watchdog call-site
+    (`base+0x915b3f3`): if it **is** the watchdog, it counts and `ret`s immediately — the
+    disconnect is swallowed; for **any other** caller (relog, logout) it runs the original prologue
+    and continues normally.
+- **Safety:** before touching anything it checks a build fingerprint (a getter at
+  `base+0x4d01a90`) and the expected `Disconnect` prologue; on a different build it simply **does
+  not install** and logs why (nothing is corrupted). The RVAs are specific to this `lu4.bin`.
+- Unlike the MAC patch (removed on world entry), the guard is **kept** for the life of the client —
+  it's what holds the connection. The result is written to `lu4loader.log`
+  (`DISCONNECT_GUARD ... result=1`) and, in the GUI, to the window status. Byte-level details in
+  `src/lu4_disconnect_guard.h`.
+
 ---
 
 ## Requirements
@@ -151,6 +172,8 @@ Any server used with this loader must provide:
 | `AuthPort` | `2107` | your AuthGateD LU4 port (portproxy target in dev) |
 | `ValidatorHost` | `127.0.0.1` | credential validator host |
 | `ValidatorPort` | `27110` | credential validator port |
+| `GamePort` | `7778` | GameServer port; an established TCP connection to it means "in-world" |
+| `DisconnectGuard` | `0` | `1` = install the idle-drop filter on world entry (see section 4) |
 | `WaitMB` | `1500` | client working set (MB) to wait for before patching |
 
 The GUI stores its accounts in `lu4loader_accounts.dat` next to the exe (one `login<TAB>password`
@@ -165,9 +188,9 @@ line each, password XOR-obfuscated — **not** security).
 src\build_lu4loader.bat
 :: or directly:
 cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader.c /Fe:lu4loader.exe ^
-   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib
+   /link user32.lib advapi32.lib shell32.lib psapi.lib ws2_32.lib iphlpapi.lib
 cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS src\lu4loader_gui.c /Fe:lu4loader_gui.exe ^
-   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib
+   /link user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib ws2_32.lib iphlpapi.lib
 ```
 `build_lu4loader.bat` calls `vcvars64.bat` from a default VS2022 path — adjust it to your install.
 The GUI's Common Controls manifest is embedded with a `#pragma`, so no `.manifest` file is needed.
@@ -181,9 +204,13 @@ the loader:
 
 - **ServerList compare** `0xBFEEA0` — a small, self-contained constant-time `memcmp`-style
   function; expected prologue once decrypted: `48 31 C0 4D 31 D2` (`xor rax,rax; xor r10,r10`).
+- **DisconnectGuard** (`src/lu4_disconnect_guard.h`): `Disconnect` `0x4CE8C60`, watchdog call-site
+  `0x915B3F3`, build fingerprint getter `0x4D01A90`. All verified at runtime before patching — a
+  mismatch just aborts the install (returns a negative code, logged), it never corrupts the client.
 
 Edit `CMP_RVA` (and `ORIG` if the prologue changes) in **both** `src/lu4loader.c` and
-`src/lu4loader_gui.c`, then rebuild.
+`src/lu4loader_gui.c`, then rebuild. The DisconnectGuard offsets live in
+`src/lu4_disconnect_guard.h`.
 
 ---
 
@@ -204,6 +231,7 @@ dist/
 src/
   lu4loader.c             console loader source
   lu4loader_gui.c         GUI loader source
+  lu4_disconnect_guard.h  idle-drop filter (DisconnectGuard; included by both)
   build_lu4loader.bat     builds both
 ```
 

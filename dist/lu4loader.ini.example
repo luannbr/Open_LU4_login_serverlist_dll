@@ -23,6 +23,20 @@ AuthPort=2107
 ValidatorHost=127.0.0.1
 ValidatorPort=27110
 
+# Porta do GameServer (serverlist). O loader considera "em jogo" quando o cliente
+# abre uma conexao TCP ESTABELECIDA pra essa porta -- e' nesse momento que ele
+# remove o patch do MAC e (se habilitado) instala o DisconnectGuard.
+GamePort=7778
+
+# DisconnectGuard (1=liga, 0=desliga). Corrige a QUEDA por ociosidade: o lu4.bin
+# tem uma rotina interna (watchdog) que, parado alguns minutos, chama o proprio
+# Disconnect e derruba a conexao -- NAO e' o servidor. Com 1, ao entrar no mundo o
+# loader instala um filtro seletivo no Disconnect do cliente: engole SO' a chamada
+# que vem do call-site do watchdog e deixa relog/logout passarem normalmente.
+# Offsets sao especificos deste build do lu4.bin (ha fingerprint; em outro build
+# ele apenas nao instala e loga o motivo). Veja src/lu4_disconnect_guard.h.
+DisconnectGuard=1
+
 GameArgs=LU4 -USEALLAVAILABLECORES
 # Quanto esperar o cliente carregar (WorkingSet em MB) antes de patchar o MAC (patch tardio).
 WaitMB=1500
