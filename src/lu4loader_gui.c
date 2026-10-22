@@ -334,6 +334,7 @@ static DWORD WINAPI launchThread(LPVOID p){
     unsigned short gamePort=(unsigned short)atoi(g_gamePort);
     int inWorld=0, outOfGameTicks=0;
     int guardAttempted=0, guardResult=0;
+    unsigned long long guardAlive=0; int guardCleared=0; /* flag "alive" na cave + estado da queda */
     const DWORD kPatchRights=PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_QUERY_INFORMATION;
     while(1){
         if(h && GetExitCodeProcess(h,&code)&&code!=STILL_ACTIVE){ setStatus("Cliente encerrado."); logLine("cliente saiu (exit %#lx)",code); break; }
@@ -344,11 +345,16 @@ static DWORD WINAPI launchThread(LPVOID p){
                 /* Remove o patch de login; mantem o guard seletivo instalado. */
                 if(h){
                     if(g_disconnectGuard && !guardAttempted){
-                        unsigned long long counter=0;
-                        guardResult=installDisconnectGuard(h,base,&counter);
+                        unsigned long long counter=0, alive=0;
+                        guardResult=installDisconnectGuard(h,base,&counter,&alive);
                         guardAttempted=1;
-                        logLine("DISCONNECT_GUARD pid=%lu result=%d base=%#llx counter=%#llx",pi.dwProcessId,guardResult,base,counter);
+                        guardAlive=(guardResult==1)?alive:0;
+                        logLine("DISCONNECT_GUARD pid=%lu result=%d base=%#llx counter=%#llx alive=%#llx",pi.dwProcessId,guardResult,base,counter,alive);
+                    } else if(g_disconnectGuard && guardAlive){
+                        unsigned char one=1; WriteProcessMemory(h,(LPVOID)(uintptr_t)guardAlive,&one,1,NULL);
+                        logLine("DISCONNECT_GUARD re-armado (alive=1) no relog");
                     }
+                    guardCleared=0;
                     if(cave){ restoreOrig(h,cmp); VirtualFreeEx(h,(LPVOID)(uintptr_t)cave,0,MEM_RELEASE); logLine("EM JOGO: restaurei orig em %#llx, liberei cave %#llx",cmp,cave); cave=0; }
                     else logLine("EM JOGO: sem cave p/ liberar (ja limpo)");
                     CloseHandle(h); h=NULL; logLine("EM JOGO: handle do processo fechado");
@@ -359,6 +365,12 @@ static DWORD WINAPI launchThread(LPVOID p){
                     "Em jogo. Falha ao instalar DisconnectGuard; consulte o log.");
             }
         } else {
+            if(inWorld && guardAlive && !guardCleared){
+                /* conexao do jogo caiu: libera a desconexao (flag alive=0), 1 vez por queda */
+                HANDLE hw=OpenProcess(kPatchRights,FALSE,pi.dwProcessId);
+                if(hw){ unsigned char zero=0; WriteProcessMemory(hw,(LPVOID)(uintptr_t)guardAlive,&zero,1,NULL); CloseHandle(hw); guardCleared=1;
+                        logLine("GUARD: conexao do jogo caiu -> alive=0 (desconexao liberada ao cliente)"); }
+            }
             if(inWorld){
                 if(++outOfGameTicks>=10){
                     inWorld=0; outOfGameTicks=0;

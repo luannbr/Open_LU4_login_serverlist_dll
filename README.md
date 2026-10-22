@@ -91,21 +91,27 @@ byte as before.
   `lu4.bin` client **drops its own connection**. It isn't the server — the packet ring stays clean
   and the ping is answered to the very end. It's an internal routine (a watchdog) in this client
   build that calls its own `Disconnect`.
-- Since the same `Disconnect` is used by legitimate relog/logout, the function can't just be
-  NOP-ed. With `DisconnectGuard=1`, on world entry the loader installs — from outside, with no DLL
-  and no remote thread — a **selective filter** on the client's `Disconnect` (`base+0x4ce8c60`):
-  - it redirects the prologue to a small trampoline (allocated with `VirtualAllocEx`);
-  - the trampoline compares the return address (`[rsp]`) with the watchdog call-site
-    (`base+0x915b3f3`): if it **is** the watchdog, it counts and `ret`s immediately — the
-    disconnect is swallowed; for **any other** caller (relog, logout) it runs the original prologue
-    and continues normally.
-- **Safety:** before touching anything it checks a build fingerprint (a getter at
-  `base+0x4d01a90`) and the expected `Disconnect` prologue; on a different build it simply **does
-  not install** and logs why (nothing is corrupted). The RVAs are specific to this `lu4.bin`.
-- Unlike the MAC patch (removed on world entry), the guard is **kept** for the life of the client —
-  it's what holds the connection. The result is written to `lu4loader.log`
-  (`DISCONNECT_GUARD ... result=1`) and, in the GUI, to the window status. Byte-level details in
-  `src/lu4_disconnect_guard.h`.
+- **That same watchdog is also the path for real drops:** when the server dies/resets, the tick
+  notices the dead socket and calls the SAME `Disconnect`. So filtering by call-site alone would
+  also kill "server offline / reconnect". The decision must be by **liveness**.
+- With `DisconnectGuard=1`, on world entry the loader installs — from outside, no DLL and no remote
+  thread — a **liveness-aware** filter on `Disconnect` (`base+0x4ce8c60`):
+  - it redirects the prologue to a trampoline (via `VirtualAllocEx`) that reads an "alive" flag in
+    the cave itself;
+  - it swallows the disconnect only when the call comes from the watchdog call-site
+    (`base+0x915b3f3`), with `notify!=0`, **and the "alive" flag is 1** (connection live). Any other
+    caller (relog/logout), or the flag at 0, passes through;
+  - the **loader maintains the flag** from its TCP-table poll: it's 1 while the game connection is
+    established and it clears it the moment the connection drops — then the next disconnect goes
+    through and the client shows "disconnected". During healthy play it keeps **no open handle**: it
+    only reopens for one byte when the connection drops.
+- **Safety:** before touching anything it checks a build fingerprint (getter `base+0x4d01a90`) and
+  the expected `Disconnect` prologue; on a different build it **does not install** and logs why
+  (nothing is corrupted). The RVAs are specific to this `lu4.bin`.
+- **Limitation:** covers server offline / reset / FIN (the TCP state changes). A silent freeze with
+  no FIN keeps the TCP established and only drops via the OS keepalive. Result in `lu4loader.log`
+  (`DISCONNECT_GUARD ... result=1`, `GUARD: connection dropped -> alive=0`) and the GUI status.
+  Byte-level details in `src/lu4_disconnect_guard.h`. Liveness-aware improvements by **Maxicroma**.
 
 ---
 

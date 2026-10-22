@@ -42,17 +42,25 @@ Constants (build-specific; `base` = first module of the client process via `Enum
   `LoginIp 185.29.255.102`, `LoginPort 2108`, `AuthPort 2107`, `ValidatorHost 127.0.0.1`,
   `ValidatorPort 27110`, `GamePort 7778`, `LocalDev 1`, `AutoFillLogin 1`, `DisconnectGuard 0`,
   `WaitMB 1500`.
-- `DisconnectGuard` (`lu4_disconnect_guard.h`, `installDisconnectGuard(process, base, &counter)`;
-  off by default): fixes the client's idle self-disconnect. Target `Disconnect = base+0x4CE8C60`
-  (prologue `48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20`), watchdog call-site
-  `caller = base+0x915B3F3`, build fingerprint getter `base+0x4D01A90` (`48 8B 05 89 75 6C 03 C3`).
-  It `VirtualAllocEx`es 2 pages (page0 = RX trampoline, page1 = u64 call counter), rewrites the
-  `Disconnect` prologue with a 15-byte `FF 25 <rip+0> <remote u64>; nop`. Trampoline: `mov
-  rax,[rsp]` (Disconnect is reached by JMP, so `[rsp]` is still the caller's return addr); if it
-  equals `caller`, `lock inc [counter]` then `ret` — swallows the watchdog's disconnect; otherwise
-  run the original 15 bytes and `jmp Disconnect+15` — relog/logout pass through. Returns `1` ok, or
-  `-1`(getter mismatch)/`-2`(prologue mismatch)/`-3..-8` (alloc/write/protect/flush) without
-  corrupting the client. The allocation is kept until the client exits (a call may be in flight).
+- `DisconnectGuard` (`lu4_disconnect_guard.h`,
+  `installDisconnectGuard(process, base, &counter, &alive)`; off by default): fixes the client's
+  idle self-disconnect WITHOUT breaking real drops. Target `Disconnect = base+0x4CE8C60` (prologue
+  `48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20`), watchdog call-site `caller = base+0x915B3F3`,
+  build fingerprint getter `base+0x4D01A90` (`48 8B 05 89 75 6C 03 C3`). NOTE: the watchdog
+  call-site is ALSO the path for genuine drops (server offline/reset), so call-site alone can't
+  discriminate — the guard is **liveness-aware**. It `VirtualAllocEx`es 2 pages (page0 = RX 83-byte
+  trampoline, page1 = u64 counter at +0 and a 1-byte "alive" flag at +8, flag seeded to 1), and
+  rewrites the `Disconnect` prologue with a 15-byte `FF 25 <rip+0> <remote u64>; nop`. Trampoline:
+  `mov rax,[rsp]` (reached by JMP, so `[rsp]` is the caller's return addr); it swallows the call
+  (`lock inc [counter]; ret`) ONLY when `rax==caller` AND `notify(dl)!=0` AND `byte[alive]!=0`;
+  otherwise it runs the original 15 bytes and `jmp Disconnect+15` (relog/logout, or a real drop with
+  alive==0, pass through). The **loader owns the flag**: it stays 1 while `clientInGame(GamePort)`
+  holds, is cleared to 0 the moment the game TCP connection drops (reopening a handle for one byte),
+  and is re-armed to 1 on world re-entry (relog). During healthy play the loader keeps no open
+  handle. Returns `1` ok (sets `*counter`,`*alive`), or `-1`(getter)/`-2`(prologue)/`-3..-8`
+  (alloc/write/protect/flush) without corrupting the client. The allocation is kept until the client
+  exits. Covers server offline/reset/FIN (TCP state changes), not a silent freeze (TCP stays
+  ESTABLISHED until OS keepalive). Liveness-aware design credited to Maxicroma.
 
 Flow (`main`):
 1. `loadConfig()` from `lu4loader.ini` next to the exe (flat `key=value`, `#`/`;` comments, paths
@@ -73,12 +81,15 @@ Flow (`main`):
      `CAVE`; write 14-byte `FF 25 00000000 <cave u64>`) then `sendBridge()`. If cave present →
      `reapplyJmp()` and refresh `sendBridge()` every 120 s.
    - **Entering world** (first `inWorld`): if `DisconnectGuard=1` and not yet attempted →
-     `installDisconnectGuard()` once (logged with its result + counter addr). Then `restoreOrig()`
-     (undo the MAC jmp), `VirtualFreeEx` the cave, and `CloseHandle` — so the client's anti-tamper
-     finds no RWX page / no external VM_WRITE handle. The MAC compare is only used at auth, so the
-     patch must leave; the guard (if installed) stays and is what holds the connection.
-   - **Leaving world** (relog): after ~10 ticks of `!inGame`, `OpenProcess` again (if it fails the
-     client exited → stop) and resume re-patching the MAC for the next login.
+     `installDisconnectGuard()` once (keep `guardAlive` = the returned flag addr); on a later world
+     re-entry (relog) just re-arm the flag to 1. Reset `guardCleared=0`. Then `restoreOrig()` (undo
+     the MAC jmp), `VirtualFreeEx` the cave, and `CloseHandle` — so the client's anti-tamper finds
+     no RWX page / no external VM_WRITE handle. The MAC compare is only used at auth, so the patch
+     must leave; the guard (if installed) stays and holds the connection while alive.
+   - **Leaving world / connection drop** (`!inGame`): if the guard is active and not yet cleared,
+     reopen a handle for one byte and write the "alive" flag = 0 (so the next watchdog `Disconnect`
+     is let through and the client shows "disconnected"); then, after ~10 ticks, `OpenProcess` again
+     (if it fails the client exited → stop) and resume re-patching the MAC for the next login.
 7. `sendBridge(host, port, login, pass)`: TCP connect, send `"AUTH\t<login>\t<pass>\n"`, read one
    reply; prefix `OK` → accepted, else rejected (logged). No retry on connect failure beyond the
    120 s refresh. All state transitions are timestamped to `lu4loader.log` (`lu4loader_gui.log` for

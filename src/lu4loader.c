@@ -385,6 +385,8 @@ int main(int argc, char **argv) {
     int outOfGameTicks = 0; /* debounce p/ voltar ao auth (evita re-patch por leitura TCP transiente) */
     int announced = 0;
     int guardAttempted = 0;
+    unsigned long long guardAlive = 0; /* endereco da flag "alive" na cave do guard (0 = sem guard) */
+    int guardCleared = 0;              /* 1 = flag ja zerada nesta queda (evita reabrir handle a cada tick) */
     /* direitos p/ reabrir o handle no relog (VM p/ patchar + query p/ exit code) */
     const DWORD kPatchRights = PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_QUERY_INFORMATION;
     while (1) {
@@ -399,12 +401,19 @@ int main(int argc, char **argv) {
                 /* Remove o patch de login; o guard seletivo permanece ativo. */
                 if (h) {
                     if (g_disconnectGuard && !guardAttempted) {
-                        unsigned long long counter = 0;
-                        int result = installDisconnectGuard(h, base, &counter);
+                        unsigned long long counter = 0, alive = 0;
+                        int result = installDisconnectGuard(h, base, &counter, &alive);
                         guardAttempted = 1;
-                        logLine("DISCONNECT_GUARD pid=%lu result=%d base=%#llx counter=%#llx", pi.dwProcessId, result, base, counter);
-                        printf("[DisconnectGuard] %s (result=%d).\n", result==1 ? "ativo; filtro seletivo instalado" : "FALHOU; consulte o log", result);
+                        guardAlive = (result == 1) ? alive : 0;
+                        logLine("DISCONNECT_GUARD pid=%lu result=%d base=%#llx counter=%#llx alive=%#llx", pi.dwProcessId, result, base, counter, alive);
+                        printf("[DisconnectGuard] %s (result=%d).\n", result==1 ? "ativo; filtro liveness-aware instalado" : "FALHOU; consulte o log", result);
+                    } else if (g_disconnectGuard && guardAlive) {
+                        /* relog: re-arma a flag como viva ao reentrar no mundo */
+                        unsigned char one = 1;
+                        WriteProcessMemory(h, (LPVOID)(uintptr_t)guardAlive, &one, 1, NULL);
+                        logLine("DISCONNECT_GUARD re-armado (alive=1) no relog");
                     }
+                    guardCleared = 0;
                     if (cave) {
                         restoreOrig(h, cmp);
                         VirtualFreeEx(h, (LPVOID)(uintptr_t)cave, 0, MEM_RELEASE);
@@ -420,6 +429,19 @@ int main(int argc, char **argv) {
                 printf("[OK] em jogo: patch do MAC removido e handle fechado; DisconnectGuard conforme log.\n");
             }
         } else {
+            if (inWorld && guardAlive && !guardCleared) {
+                /* a conexao do jogo caiu enquanto o guard a segurava: libera a
+                 * desconexao zerando a flag "alive" (reabre o handle so' p/ 1 byte,
+                 * 1 vez por queda; o cliente entao mostra "disconnected" normal). */
+                HANDLE hw = OpenProcess(kPatchRights, FALSE, pi.dwProcessId);
+                if (hw) {
+                    unsigned char zero = 0;
+                    WriteProcessMemory(hw, (LPVOID)(uintptr_t)guardAlive, &zero, 1, NULL);
+                    CloseHandle(hw);
+                    guardCleared = 1;
+                    logLine("GUARD: conexao do jogo caiu -> alive=0 (desconexao liberada ao cliente)");
+                }
+            }
             if (inWorld) {
                 /* debounce: so' volta ao auth depois de ~3s fora do jogo (relog) */
                 if (++outOfGameTicks >= 10) {

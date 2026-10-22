@@ -92,21 +92,25 @@ byte como antes.
   **derruba a própria conexão**. Não é o servidor — o ring de pacotes fica limpo e o ping é
   respondido até o fim. É uma rotina interna (watchdog) do build do cliente que chama o próprio
   `Disconnect`.
-- Como o mesmo `Disconnect` é usado por relog/logout legítimos, não dá pra NOP-ar a função. Com
-  `DisconnectGuard=1`, ao entrar no mundo o loader instala de fora um **filtro seletivo** no
-  `Disconnect` do cliente (`base+0x4ce8c60`), sem DLL e sem thread remota:
-  - desvia o prólogo pra um pequeno trampolim (alocado com `VirtualAllocEx`);
-  - o trampolim compara o endereço de retorno (`[rsp]`) com o call-site do watchdog
-    (`base+0x915b3f3`): se **for** o watchdog, conta e faz `ret` imediato — a desconexão é
-    engolida; se for **qualquer outra** origem (relog, logout), executa o prólogo original e segue
-    normal.
-- **Segurança:** antes de tocar em nada ele confere um *fingerprint* do build (um getter em
-  `base+0x4d01a90`) e o prólogo esperado do `Disconnect`; em outro build ele **não instala** e loga
-  o motivo (não corrompe nada). Os RVAs são específicos deste `lu4.bin`.
-- Ao contrário do patch do MAC (removido ao entrar no mundo), o guard é **mantido** enquanto o
-  cliente roda — é ele que segura a conexão. O resultado vai pro `lu4loader.log`
-  (`DISCONNECT_GUARD ... result=1`) e, no GUI, pro status da janela. Detalhes byte a byte em
-  `src/lu4_disconnect_guard.h`.
+- **Esse mesmo watchdog também é o caminho das quedas reais:** quando o servidor cai/reseta, o tick
+  percebe o socket morto e chama o MESMO `Disconnect`. Por isso filtrar só pelo call-site mataria
+  junto o "server offline / reconnect". A decisão tem que ser por **liveness**.
+- Com `DisconnectGuard=1`, ao entrar no mundo o loader instala de fora (sem DLL e sem thread remota)
+  um filtro **liveness-aware** no `Disconnect` (`base+0x4ce8c60`):
+  - desvia o prólogo pra um trampolim (via `VirtualAllocEx`) que lê uma flag "alive" na própria cave;
+  - só engole a desconexão quando ela vem do call-site do watchdog (`base+0x915b3f3`), com
+    `notify!=0`, **E a flag "alive" está 1** (conexão viva). Qualquer outra origem (relog/logout),
+    ou a flag em 0, passa normal;
+  - o **loader mantém a flag** a partir do seu poll da tabela TCP: vale 1 enquanto a conexão do jogo
+    está estabelecida e ele a zera no instante em que ela cai — aí a próxima desconexão passa e o
+    cliente mostra "disconnected". No jogo saudável **não mantém handle aberto**: só reabre pra 1
+    byte quando a conexão cai.
+- **Segurança:** antes de tocar em nada confere o *fingerprint* do build (getter `base+0x4d01a90`) e
+  o prólogo esperado do `Disconnect`; em outro build **não instala** e loga (não corrompe nada).
+- **Limitação:** cobre server offline / reset / FIN (muda o estado TCP). Um *freeze* silencioso sem
+  FIN mantém o TCP estabelecido e só cai pelo keepalive do SO. Resultado no `lu4loader.log`
+  (`DISCONNECT_GUARD ... result=1`, `GUARD: conexao caiu -> alive=0`) e no status do GUI. Detalhes
+  byte a byte em `src/lu4_disconnect_guard.h`. Melhorias liveness-aware por **Maxicroma**.
 
 ---
 

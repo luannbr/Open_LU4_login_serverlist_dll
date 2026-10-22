@@ -31,10 +31,11 @@ GamePort=7778
 # DisconnectGuard (1=liga, 0=desliga). Corrige a QUEDA por ociosidade: o lu4.bin
 # tem uma rotina interna (watchdog) que, parado alguns minutos, chama o proprio
 # Disconnect e derruba a conexao -- NAO e' o servidor. Com 1, ao entrar no mundo o
-# loader instala um filtro seletivo no Disconnect do cliente: engole SO' a chamada
-# que vem do call-site do watchdog e deixa relog/logout passarem normalmente.
-# Offsets sao especificos deste build do lu4.bin (ha fingerprint; em outro build
-# ele apenas nao instala e loga o motivo). Veja src/lu4_disconnect_guard.h.
+# loader instala um filtro LIVENESS-AWARE no Disconnect: so' engole a chamada do
+# watchdog ENQUANTO a conexao esta viva; se o server cai/reseta, o loader zera a
+# flag "alive" e a desconexao passa (o cliente mostra "disconnected"). Relog/logout
+# nunca sao tocados. Offsets especificos deste build (ha fingerprint; em outro build
+# nao instala e loga). Veja src/lu4_disconnect_guard.h. Liveness-aware: Maxicroma.
 DisconnectGuard=1
 
 GameArgs=LU4 -USEALLAVAILABLECORES

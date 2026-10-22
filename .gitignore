@@ -11,3 +11,4 @@ lu4loader_accounts.dat
 *.ilk
 *.exp
 *.lib
+*.manifest
